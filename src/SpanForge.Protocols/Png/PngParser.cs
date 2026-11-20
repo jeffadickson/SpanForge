@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 
 namespace SpanForge.Protocols.Png;
 
@@ -40,15 +41,117 @@ public readonly record struct UnknownChunk(uint TypeCode, ByteSlice Data)
 }
 
 /// <summary>
-/// Native C# 15 <c>union</c> representing every decoded PNG chunk variant with exhaustive pattern matching.
+/// Zero-boxing C# 15 custom <c>[Union]</c> representing every decoded PNG chunk variant with exhaustive
+/// pattern matching and 0 bytes of heap allocation per chunk.
 /// </summary>
-public union PngChunk(IhdrChunk, PlteChunk, IdatChunk, TextChunk, IendChunk, UnknownChunk);
+[Union]
+public readonly struct PngChunk : IUnion
+{
+    private readonly uint _a;
+    private readonly uint _b;
+    private readonly uint _c;
+    private readonly uint _d;
+    private readonly byte _tag; // 1=Ihdr, 2=Plte, 3=Idat, 4=Text, 5=Iend, 6=Unknown
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(IhdrChunk h)
+    {
+        _a = h.Width;
+        _b = h.Height;
+        _c = h.BitDepth
+            | ((uint)h.ColorType << 8)
+            | ((uint)h.Compression << 16)
+            | ((uint)h.Filter << 24);
+        _d = h.Interlace;
+        _tag = 1;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(PlteChunk p) => (_a, _b, _c, _d, _tag) = ((uint)p.Entries.Offset, (uint)p.Entries.Length, 0u, 0u, 2);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(IdatChunk d) => (_a, _b, _c, _d, _tag) = ((uint)d.Data.Offset, (uint)d.Data.Length, 0u, 0u, 3);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(TextChunk t) => (_a, _b, _c, _d, _tag) = ((uint)t.Keyword.Offset, (uint)t.Keyword.Length, (uint)t.Text.Offset, (uint)t.Text.Length, 4);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(IendChunk _) => (_a, _b, _c, _d, _tag) = (0u, 0u, 0u, 0u, 5);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public PngChunk(UnknownChunk u) => (_a, _b, _c, _d, _tag) = (u.TypeCode, (uint)u.Data.Offset, (uint)u.Data.Length, 0u, 6);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private IhdrChunk UnpackIhdr() => new(
+        _a,
+        _b,
+        (byte)_c,
+        (PngColorType)(byte)(_c >> 8),
+        (byte)(_c >> 16),
+        (byte)(_c >> 24),
+        (byte)_d);
+
+    public object? Value => _tag switch
+    {
+        1 => UnpackIhdr(),
+        2 => new PlteChunk(new ByteSlice((int)_a, (int)_b)),
+        3 => new IdatChunk(new ByteSlice((int)_a, (int)_b)),
+        4 => new TextChunk(new ByteSlice((int)_a, (int)_b), new ByteSlice((int)_c, (int)_d)),
+        5 => default(IendChunk),
+        6 => new UnknownChunk(_a, new ByteSlice((int)_b, (int)_c)),
+        _ => null,
+    };
+
+    public bool HasValue => _tag != 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out IhdrChunk value)
+    {
+        if (_tag == 1) { value = UnpackIhdr(); return true; }
+        value = default; return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out PlteChunk value)
+    {
+        if (_tag == 2) { value = new PlteChunk(new ByteSlice((int)_a, (int)_b)); return true; }
+        value = default; return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out IdatChunk value)
+    {
+        if (_tag == 3) { value = new IdatChunk(new ByteSlice((int)_a, (int)_b)); return true; }
+        value = default; return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out TextChunk value)
+    {
+        if (_tag == 4) { value = new TextChunk(new ByteSlice((int)_a, (int)_b), new ByteSlice((int)_c, (int)_d)); return true; }
+        value = default; return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out IendChunk value)
+    {
+        value = default;
+        return _tag == 5;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetValue(out UnknownChunk value)
+    {
+        if (_tag == 6) { value = new UnknownChunk(_a, new ByteSlice((int)_b, (int)_c)); return true; }
+        value = default; return false;
+    }
+}
 
 public sealed record class PngDocument(IhdrChunk Header, IReadOnlyList<PngChunk> Chunks);
 
 /// <summary>
-/// Zero-copy PNG binary parser with CRC-32 validation, streaming chunk support,
-/// and exhaustive C# 15 <c>union PngChunk</c> results.
+/// Zero-copy PNG binary parser with slicing-by-8 CRC-32 validation, streaming chunk support,
+/// and exhaustive zero-boxing C# 15 <c>[Union] PngChunk</c> results.
 /// </summary>
 public static class PngParser
 {
@@ -60,7 +163,7 @@ public static class PngParser
     private const uint TypeText = 0x74455874; // "tEXt"
     private const uint TypeIend = 0x49454E44; // "IEND"
 
-    private static readonly uint[] CrcTable = BuildCrcTable();
+    private static readonly uint[][] CrcTables = BuildCrcTables();
 
     public static ParseResult<ByteSlice> ParseSignature(ref ByteCursor cursor) =>
         cursor.Tag(Signature).WithContext("PNG 8-byte magic signature");
@@ -277,13 +380,40 @@ public static class PngParser
         return new Parsed<PngDocument>(new PngDocument(header, chunks));
     }
 
-    /// <summary>Computes IEEE 802.3 CRC-32 (zero allocations).</summary>
+    /// <summary>Computes IEEE 802.3 CRC-32 using safe slicing-by-8 lookup tables (zero allocations).</summary>
     public static uint ComputeCrc32(ReadOnlySpan<byte> data)
     {
+        uint[][] tables = CrcTables;
+        uint[] t0 = tables[0];
+        uint[] t1 = tables[1];
+        uint[] t2 = tables[2];
+        uint[] t3 = tables[3];
+        uint[] t4 = tables[4];
+        uint[] t5 = tables[5];
+        uint[] t6 = tables[6];
+        uint[] t7 = tables[7];
+
         uint crc = 0xFFFF_FFFFu;
-        for (int i = 0; i < data.Length; i++)
+        int i = 0;
+        int end8 = data.Length - 7;
+        while (i < end8)
         {
-            crc = CrcTable[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+            uint lo = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i, 4)) ^ crc;
+            uint hi = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i + 4, 4));
+            crc = t7[lo & 0xFF]
+                ^ t6[(lo >> 8) & 0xFF]
+                ^ t5[(lo >> 16) & 0xFF]
+                ^ t4[lo >> 24]
+                ^ t3[hi & 0xFF]
+                ^ t2[(hi >> 8) & 0xFF]
+                ^ t1[(hi >> 16) & 0xFF]
+                ^ t0[hi >> 24];
+            i += 8;
+        }
+
+        for (; i < data.Length; i++)
+        {
+            crc = t0[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
         }
 
         return ~crc;
@@ -303,9 +433,15 @@ public static class PngParser
         return result;
     }
 
-    private static uint[] BuildCrcTable()
+    private static uint[][] BuildCrcTables()
     {
-        var table = new uint[256];
+        var tables = new uint[8][];
+        for (int t = 0; t < 8; t++)
+        {
+            tables[t] = new uint[256];
+        }
+
+        uint[] t0 = tables[0];
         for (uint i = 0; i < 256; i++)
         {
             uint c = i;
@@ -314,9 +450,20 @@ public static class PngParser
                 c = (c & 1) != 0 ? 0xEDB8_8320u ^ (c >> 1) : c >> 1;
             }
 
-            table[i] = c;
+            t0[i] = c;
         }
 
-        return table;
+        for (int t = 1; t < 8; t++)
+        {
+            uint[] prev = tables[t - 1];
+            uint[] curr = tables[t];
+            for (int i = 0; i < 256; i++)
+            {
+                uint c = prev[i];
+                curr[i] = (c >> 8) ^ t0[c & 0xFF];
+            }
+        }
+
+        return tables;
     }
 }

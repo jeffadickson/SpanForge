@@ -53,13 +53,17 @@ public ref struct BitCursor
     public void Reset(BitCheckpoint checkpoint) => _bitPosition = checkpoint.BitPosition;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private readonly ParseResult<T> BitShortage<T>(int requiredBits)
+    private readonly ParseResult<T> BitShortage<T>(int requiredBits) =>
+        BitShortageCore<T>(_mode, CurrentByteOffset, RemainingBits, requiredBits);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<T> BitShortageCore<T>(InputMode mode, int currentByteOffset, int remainingBits, int requiredBits)
     {
-        int missingBits = requiredBits - RemainingBits;
+        int missingBits = requiredBits - remainingBits;
         int missingBytes = (missingBits + 7) >> 3;
-        return _mode == InputMode.Streaming
+        return mode == InputMode.Streaming
             ? Incomplete.AtLeast(missingBytes > 0 ? missingBytes : 1)
-            : Backtrack.At(CurrentByteOffset, ErrorKind.BitRead);
+            : Backtrack.At(currentByteOffset, ErrorKind.BitRead);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

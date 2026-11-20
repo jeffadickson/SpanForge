@@ -203,21 +203,24 @@ Console.WriteLine("=== C# 15 / .NET 11.0.100 Benchmark (SpanForge, Release + Tie
 const int WsOps = 1_000_000;
 RunBench("ws_frame", "cs15/spanforge", WsOps, 19, () => BenchWs(wsRing, WsOps));
 
-// 2. Delimited u16 (Monomorphized StructParsers)
+// 2. Delimited u16 (Monomorphized StructParsers + register-sized FastParsers<NoError>)
 const int DelimOps = 5_000_000;
+RunBench("delimited_u16", "cs15/fast", DelimOps, 4, () => BenchDelimitedFast(delimRing, DelimOps));
 RunBench("delimited_u16", "cs15/struct", DelimOps, 4, () => BenchDelimitedStruct(delimRing, DelimOps));
 RunBench("delimited_u16", "cs15/comb", DelimOps, 4, () => BenchDelimitedCombinator(delimRing, DelimOps));
 
 // 3. VarInt stream (32 varints per op)
 const int VarIntOps = 200_000;
+RunBench("varint_stream32", "cs15/fast", VarIntOps, varintAvgBytes, () => BenchVarIntFast(varintRing, VarIntOps));
 RunBench("varint_stream32", "cs15/spanforge", VarIntOps, varintAvgBytes, () => BenchVarInt(varintRing, VarIntOps));
 
 // 4. TLV stream (16 mixed-tag items per op with Alt + non-boxing [Union] TlvValue)
 const int TlvOps = 200_000;
+RunBench("tlv_stream16", "cs15/fast", TlvOps, tlvBytes, () => BenchTlvFast(tlvRing, TlvOps));
 RunBench("tlv_stream16", "cs15/struct", TlvOps, tlvBytes, () => BenchTlvStruct(tlvRing, TlvOps));
 RunBench("tlv_stream16", "cs15/comb", TlvOps, tlvBytes, () => BenchTlv(tlvRing, TlvOps));
 
-// 5. PNG full document + CRC-32 (native C# 15 `public union PngChunk`)
+// 5. PNG full document + CRC-32 (zero-boxing custom [Union] PngChunk + slicing-by-8 CRC-32)
 const int PngOps = 200_000;
 RunBench("png_chunks_crc", "cs15/spanforge", PngOps, pngBytes, () => BenchPng(pngRing, PngOps));
 
@@ -457,6 +460,75 @@ static ulong BenchPng(byte[][] ring, int ops)
     return acc;
 }
 
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchDelimitedFast(byte[][] ring, int ops)
+{
+    var parser = FastParsers.Delimited<
+        FastParsers.TagByteParser<NoError>,
+        FastParsers.U16BEParser<NoError>,
+        FastParsers.TagByteParser<NoError>,
+        byte, ushort, byte, NoError>(
+        FastParsers.TagByte<NoError>((byte)'['),
+        FastParsers.U16BE<NoError>(),
+        FastParsers.TagByte<NoError>((byte)']'));
+
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var c = ring[iter & 255].AsCursor();
+        if (parser.Parse(ref c).TryGetValue(out Parsed<ushort> ok))
+        {
+            acc = unchecked(acc + ok.Value);
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchVarIntFast(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var c = ring[iter & 255].AsCursor();
+        while (!c.IsAtEnd)
+        {
+            if (c.ReadVarUInt64<NoError>().TryGetValue(out Parsed<ulong> ok))
+            {
+                acc = unchecked(acc + ok.Value);
+            }
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchTlvFast(byte[][] ring, int ops)
+{
+    var parser = FastParsers.Alt<FastTlvU32Parser, FastTlvF64Parser, FastTlvBytesParser, TlvValue, NoError>(default, default, default);
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & 255];
+        ReadOnlySpan<byte> span = buf;
+        var c = span.AsCursor();
+        while (!c.IsAtEnd)
+        {
+            if (parser.Parse(ref c).TryGetValue(out Parsed<TlvValue> ok))
+            {
+                ulong add = ok.Value switch
+                {
+                    TlvU32(var v) => v,
+                    TlvF64(var d) => BitConverter.DoubleToUInt64Bits(d),
+                    TlvBytes(var slice) => SumBytes(span[slice]),
+                };
+                acc = unchecked(acc + add);
+            }
+        }
+    }
+    return acc;
+}
+
 // Non-boxing custom C# 15 [Union] for TLV hot-path comparison
 public readonly record struct TlvU32(uint Value);
 public readonly record struct TlvF64(double Value);
@@ -546,6 +618,48 @@ public readonly struct TlvBytesParser : IParser<TlvValue>
         var t = c.TagByte(0x03);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadLengthPrefixedBytes(LengthPrefix.U16);
+        if (!v.TryGetValue(out Parsed<ByteSlice> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        return new Parsed<TlvValue>(new TlvBytes(ok.Value));
+    }
+}
+
+public readonly struct FastTlvU32Parser : IParser<TlvValue, NoError>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
+    {
+        var cp = c.Save();
+        var t = c.TagByte<NoError>(0x01);
+        if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
+        var v = c.ReadU32BE<NoError>();
+        if (!v.TryGetValue(out Parsed<uint> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        return new Parsed<TlvValue>(new TlvU32(ok.Value));
+    }
+}
+
+public readonly struct FastTlvF64Parser : IParser<TlvValue, NoError>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
+    {
+        var cp = c.Save();
+        var t = c.TagByte<NoError>(0x02);
+        if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
+        var v = c.ReadF64BE<NoError>();
+        if (!v.TryGetValue(out Parsed<double> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        return new Parsed<TlvValue>(new TlvF64(ok.Value));
+    }
+}
+
+public readonly struct FastTlvBytesParser : IParser<TlvValue, NoError>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
+    {
+        var cp = c.Save();
+        var t = c.TagByte<NoError>(0x03);
+        if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
+        var v = c.ReadLengthPrefixedBytes<NoError>(LengthPrefix.U16);
         if (!v.TryGetValue(out Parsed<ByteSlice> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
         return new Parsed<TlvValue>(new TlvBytes(ok.Value));
     }

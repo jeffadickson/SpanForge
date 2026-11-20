@@ -21,7 +21,7 @@ public readonly record struct Checkpoint(int Position, Endianness Endianness);
 /// and .NET 11 SIMD (<see cref="SearchValues{T}"/>) + <see cref="BinaryPrimitives"/>.
 /// </para>
 /// </summary>
-public ref struct ByteCursor
+public ref partial struct ByteCursor
 {
     private readonly ReadOnlySpan<byte> _buffer;
     private int _position;
@@ -106,19 +106,27 @@ public ref struct ByteCursor
         new(_buffer[..slice.End], slice.Offset, _endianness, mode);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private readonly ParseResult<T> Shortage<T>(int requiredBytes, ErrorKind kind = ErrorKind.Eof)
+    private readonly ParseResult<T> Shortage<T>(int requiredBytes, ErrorKind kind = ErrorKind.Eof) =>
+        ShortageCore<T>(_mode, _position, RemainingLength, requiredBytes, kind);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<T> ShortageCore<T>(InputMode mode, int position, int remainingLength, int requiredBytes, ErrorKind kind)
     {
-        int missing = requiredBytes - RemainingLength;
-        return _mode == InputMode.Streaming
+        int missing = requiredBytes - remainingLength;
+        return mode == InputMode.Streaming
             ? Incomplete.AtLeast(missing > 0 ? missing : 1)
-            : Backtrack.At(_position, kind);
+            : Backtrack.At(position, kind);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private readonly ParseResult<T> UnknownShortage<T>(ErrorKind kind = ErrorKind.Eof) =>
-        _mode == InputMode.Streaming
+        UnknownShortageCore<T>(_mode, _position, kind);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<T> UnknownShortageCore<T>(InputMode mode, int position, ErrorKind kind) =>
+        mode == InputMode.Streaming
             ? Incomplete.Unknown
-            : Backtrack.At(_position, kind);
+            : Backtrack.At(position, kind);
 
     // -------------------------------------------------------------------------
     // Fixed-width integer & floating-point readers
@@ -394,39 +402,54 @@ public ref struct ByteCursor
     /// <summary>
     /// Reads an unsigned LEB128 varint (up to 64 bits / 10 bytes, as used in Protobuf, WASM, and DWARF).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ulong> ReadVarUInt64()
     {
         int start = _position;
-        ulong result = 0;
-        int shift = 0;
-
-        for (int i = 0; i < 10; i++)
+        int pos = start;
+        ReadOnlySpan<byte> buf = _buffer;
+        if ((uint)pos >= (uint)buf.Length)
         {
-            if (_position >= _buffer.Length)
+            return _mode == InputMode.Streaming
+                ? Incomplete.AtLeast(1)
+                : Backtrack.At(start, ErrorKind.Eof, "Unexpected EOF inside LEB128 varint");
+        }
+
+        byte b = buf[pos++];
+        if (b < 0x80)
+        {
+            _position = pos;
+            return new Parsed<ulong>(b);
+        }
+
+        ulong result = (ulong)(b & 0x7F);
+        int shift = 7;
+
+        for (int i = 1; i < 10; i++)
+        {
+            if ((uint)pos >= (uint)buf.Length)
             {
-                _position = start;
                 return _mode == InputMode.Streaming
                     ? Incomplete.AtLeast(1)
                     : Backtrack.At(start, ErrorKind.Eof, "Unexpected EOF inside LEB128 varint");
             }
 
-            byte b = _buffer[_position++];
+            b = buf[pos++];
             if (i == 9 && b > 1)
             {
-                _position = start;
                 return Backtrack.At(start, ErrorKind.VarInt, "LEB128 varint overflows UInt64");
             }
 
             result |= (ulong)(b & 0x7F) << shift;
             if ((b & 0x80) == 0)
             {
+                _position = pos;
                 return new Parsed<ulong>(result);
             }
 
             shift += 7;
         }
 
-        _position = start;
         return Backtrack.At(start, ErrorKind.VarInt, "LEB128 varint exceeds 10 bytes");
     }
 

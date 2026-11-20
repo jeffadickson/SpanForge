@@ -14,3 +14,13 @@ public interface IParser<T>
 {
     ParseResult<T> Parse(ref ByteCursor cursor);
 }
+
+/// <summary>
+/// Register-friendly zero-cost parser trait parameterized by a value-type error <typeparamref name="TError"/>
+/// (analogous to Rust's <c>winnow::Parser&lt;I, O, E&gt;</c> with <c>EmptyError</c> / <c>ContextError</c>).
+/// </summary>
+public interface IParser<T, TError>
+    where TError : struct, IParseError<TError>
+{
+    ParseResult<T, TError> Parse(ref ByteCursor cursor);
+}

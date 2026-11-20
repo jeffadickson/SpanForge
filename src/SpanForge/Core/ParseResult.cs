@@ -53,8 +53,22 @@ public readonly struct ParseResult<T> : IUnion
     private readonly T _value;
     private readonly object? _detail; // null | string (context) | ParseErrorDetail (context + cause chain)
     private readonly int _offsetOrNeeded; // offset for Backtrack/Failure; >=0 exact bytes or -1 unknown for Incomplete
-    private readonly ErrorKind _kind;
-    private readonly byte _tag; // 1 = Parsed<T>, 2 = Incomplete, 3 = Backtrack, 4 = Failure
+    private readonly ushort _kindAndTag; // low byte = tag (1..4), high byte = ErrorKind
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ushort PackKindAndTag(ErrorKind kind, byte tag) => (ushort)(((int)kind << 8) | tag);
+
+    private byte Tag
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => (byte)_kindAndTag;
+    }
+
+    private ErrorKind Kind
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => (ErrorKind)(_kindAndTag >> 8);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult(Parsed<T> parsed)
@@ -62,8 +76,7 @@ public readonly struct ParseResult<T> : IUnion
         _value = parsed.Value;
         _detail = null;
         _offsetOrNeeded = 0;
-        _kind = ErrorKind.None;
-        _tag = 1;
+        _kindAndTag = 1;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -72,8 +85,7 @@ public readonly struct ParseResult<T> : IUnion
         _value = default!;
         _detail = null;
         _offsetOrNeeded = incomplete.Needed.TryGetValue(out ExactBytes exact) ? exact.Count : -1;
-        _kind = ErrorKind.None;
-        _tag = 2;
+        _kindAndTag = 2;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -82,8 +94,7 @@ public readonly struct ParseResult<T> : IUnion
         _value = default!;
         _detail = PackDetail(backtrack.Error.Context, backtrack.Error.Cause);
         _offsetOrNeeded = backtrack.Error.Offset;
-        _kind = backtrack.Error.Kind;
-        _tag = 3;
+        _kindAndTag = PackKindAndTag(backtrack.Error.Kind, 3);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -92,18 +103,16 @@ public readonly struct ParseResult<T> : IUnion
         _value = default!;
         _detail = PackDetail(failure.Error.Context, failure.Error.Cause);
         _offsetOrNeeded = failure.Error.Offset;
-        _kind = failure.Error.Kind;
-        _tag = 4;
+        _kindAndTag = PackKindAndTag(failure.Error.Kind, 4);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal ParseResult(object? detail, int offsetOrNeeded, ErrorKind kind, byte tag)
+    internal ParseResult(object? detail, int offsetOrNeeded, ushort kindAndTag)
     {
         _value = default!;
         _detail = detail;
         _offsetOrNeeded = offsetOrNeeded;
-        _kind = kind;
-        _tag = tag;
+        _kindAndTag = kindAndTag;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -113,17 +122,17 @@ public readonly struct ParseResult<T> : IUnion
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ParseError UnpackError() => _detail switch
     {
-        null => new ParseError(_offsetOrNeeded, _kind),
-        string ctx => new ParseError(_offsetOrNeeded, _kind, ctx),
-        ParseErrorDetail d => new ParseError(_offsetOrNeeded, _kind, d.Context, d.Cause),
-        _ => new ParseError(_offsetOrNeeded, _kind),
+        null => new ParseError(_offsetOrNeeded, Kind),
+        string ctx => new ParseError(_offsetOrNeeded, Kind, ctx),
+        ParseErrorDetail d => new ParseError(_offsetOrNeeded, Kind, d.Context, d.Cause),
+        _ => new ParseError(_offsetOrNeeded, Kind),
     };
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Needed UnpackNeeded() =>
         _offsetOrNeeded > 0 ? Needed.Bytes(_offsetOrNeeded) : Needed.Unknown;
 
-    public object? Value => _tag switch
+    public object? Value => Tag switch
     {
         1 => new Parsed<T>(_value),
         2 => new Incomplete(UnpackNeeded()),
@@ -132,17 +141,17 @@ public readonly struct ParseResult<T> : IUnion
         _ => null,
     };
 
-    public bool HasValue => _tag != 0;
-    public bool IsParsed => _tag == 1;
-    public bool IsIncomplete => _tag == 2;
-    public bool IsBacktrack => _tag == 3;
-    public bool IsFailure => _tag == 4;
-    public bool IsError => _tag is 3 or 4;
+    public bool HasValue => _kindAndTag != 0;
+    public bool IsParsed => _kindAndTag == 1;
+    public bool IsIncomplete => _kindAndTag == 2;
+    public bool IsBacktrack => Tag == 3;
+    public bool IsFailure => Tag == 4;
+    public bool IsError => Tag is 3 or 4;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out Parsed<T> value)
     {
-        if (_tag == 1)
+        if (_kindAndTag == 1)
         {
             value = new Parsed<T>(_value);
             return true;
@@ -155,7 +164,7 @@ public readonly struct ParseResult<T> : IUnion
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out Incomplete value)
     {
-        if (_tag == 2)
+        if (_kindAndTag == 2)
         {
             value = new Incomplete(UnpackNeeded());
             return true;
@@ -168,7 +177,7 @@ public readonly struct ParseResult<T> : IUnion
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out Backtrack value)
     {
-        if (_tag == 3)
+        if (Tag == 3)
         {
             value = new Backtrack(UnpackError());
             return true;
@@ -181,7 +190,7 @@ public readonly struct ParseResult<T> : IUnion
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out Failure value)
     {
-        if (_tag == 4)
+        if (Tag == 4)
         {
             value = new Failure(UnpackError());
             return true;
@@ -196,13 +205,13 @@ public readonly struct ParseResult<T> : IUnion
     /// (equivalent to Rust's <c>nom::combinator::cut</c> / <c>winnow::combinator::cut_err</c>).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ParseResult<T> Cut() => _tag == 3 ? new ParseResult<T>(_detail, _offsetOrNeeded, _kind, 4) : this;
+    public ParseResult<T> Cut() => Tag == 3 ? new ParseResult<T>(_detail, _offsetOrNeeded, PackKindAndTag(Kind, 4)) : this;
 
     /// <summary>
     /// Escalates a <see cref="Backtrack"/> into a <see cref="Failure"/> and attaches context.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ParseResult<T> Cut(string context) => _tag is 3 or 4
+    public ParseResult<T> Cut(string context) => Tag is 3 or 4
         ? new Failure(UnpackError().WithContext(context))
         : this;
 
@@ -211,7 +220,7 @@ public readonly struct ParseResult<T> : IUnion
     /// No-op with zero allocations on <see cref="Parsed{T}"/> and <see cref="Incomplete"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ParseResult<T> WithContext(string context) => _tag switch
+    public ParseResult<T> WithContext(string context) => Tag switch
     {
         3 => new Backtrack(UnpackError().WithContext(context)),
         4 => new Failure(UnpackError().WithContext(context)),
@@ -223,24 +232,24 @@ public readonly struct ParseResult<T> : IUnion
     /// and <see cref="Failure"/> states unchanged.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ParseResult<TOut> Map<TOut>(Func<T, TOut> mapper) => _tag == 1
+    public ParseResult<TOut> Map<TOut>(Func<T, TOut> mapper) => _kindAndTag == 1
         ? new Parsed<TOut>(mapper(_value))
-        : new ParseResult<TOut>(_detail, _offsetOrNeeded, _kind, _tag);
+        : new ParseResult<TOut>(_detail, _offsetOrNeeded, _kindAndTag);
 
     /// <summary>
     /// Closure-free <see cref="Map{TOut}(Func{T, TOut})"/> overload taking an explicit state parameter.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ParseResult<TOut> Map<TState, TOut>(TState state, Func<TState, T, TOut> mapper) => _tag == 1
+    public ParseResult<TOut> Map<TState, TOut>(TState state, Func<TState, T, TOut> mapper) => _kindAndTag == 1
         ? new Parsed<TOut>(mapper(state, _value))
-        : new ParseResult<TOut>(_detail, _offsetOrNeeded, _kind, _tag);
+        : new ParseResult<TOut>(_detail, _offsetOrNeeded, _kindAndTag);
 
     /// <summary>
     /// Validates a parsed value with a predicate, converting failed checks into <see cref="Backtrack"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<T> Verify(Func<T, bool> predicate, int offset, string? context = null) =>
-        _tag == 1 && !predicate(_value)
+        _kindAndTag == 1 && !predicate(_value)
             ? Backtrack.At(offset, ErrorKind.Verify, context)
             : this;
 
@@ -250,13 +259,13 @@ public readonly struct ParseResult<T> : IUnion
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TOut> PropagateNonParsed<TOut>() =>
-        new(_detail, _offsetOrNeeded, _kind, _tag);
+        new(_detail, _offsetOrNeeded, _kindAndTag);
 
     /// <summary>
     /// Extracts the parsed value or throws <see cref="InvalidOperationException"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public T Unwrap() => _tag == 1 ? _value : ThrowUnwrapFailed();
+    public T Unwrap() => _kindAndTag == 1 ? _value : ThrowUnwrapFailed();
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private T ThrowUnwrapFailed() => this switch
