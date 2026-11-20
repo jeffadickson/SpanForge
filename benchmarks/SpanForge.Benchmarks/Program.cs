@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using SpanForge;
 using SpanForge.Protocols.Png;
 using SpanForge.Protocols.WebSocket;
@@ -152,13 +153,16 @@ static byte[][] GenPngRing()
 // Benchmark Harness (TieredPGO warmup + 7 runs, median ns/op + alloc bytes/op)
 // ============================================================================
 
-static void RunBench(string name, string engine, int opsPerRun, int bytesPerOp, Func<ulong> fn)
+static void RunBench(string name, string engine, int opsPerRun, int bytesPerOp, Func<int, ulong> fn)
 {
-    // Generous warmup so .NET 11 TieredPGO promotes hot loops to Tier 1 optimized code!
-    ulong expected = fn();
-    for (int w = 0; w < 4; w++)
+    // Trigger .NET 11 TieredPGO promotion (default call count threshold is 30 + 100ms timer) before full-scale timing!
+    for (int w = 0; w < 40; w++) _ = fn(256);
+    Thread.Sleep(180);
+
+    ulong expected = fn(opsPerRun);
+    for (int w = 0; w < 2; w++)
     {
-        ulong check = fn();
+        ulong check = fn(opsPerRun);
         if (check != expected) throw new InvalidOperationException("Warmup checksum mismatch");
     }
 
@@ -170,7 +174,7 @@ static void RunBench(string name, string engine, int opsPerRun, int bytesPerOp, 
     {
         long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
         long startTs = Stopwatch.GetTimestamp();
-        lastChk = fn();
+        lastChk = fn(opsPerRun);
         var elapsed = Stopwatch.GetElapsedTime(startTs);
         allocBytes = GC.GetAllocatedBytesForCurrentThread() - beforeAlloc;
 
@@ -199,30 +203,36 @@ int pngBytes = pngRing[0].Length;
 
 Console.WriteLine("=== C# 15 / .NET 11.0.100 Benchmark (SpanForge, Release + TieredPGO) ===");
 
-// 1. WebSocket Frame (BitCursor + zero-boxing [Union] WebSocketFrame + UnmaskInto)
+// 1. WebSocket Frame (zero-boxing [Union] WebSocketFrame + 64-bit word UnmaskInto)
 const int WsOps = 1_000_000;
-RunBench("ws_frame", "cs15/spanforge", WsOps, 19, () => BenchWs(wsRing, WsOps));
+RunBench("ws_frame", "cs15/try", WsOps, 19, ops => BenchWsTry(wsRing, ops));
+RunBench("ws_frame", "cs15/spanforge", WsOps, 19, ops => BenchWs(wsRing, ops));
 
-// 2. Delimited u16 (Monomorphized StructParsers + register-sized FastParsers<NoError>)
+// 2. Delimited u16 (TryParsers + FastParsers<NoError> + StructParsers + Combinators)
 const int DelimOps = 5_000_000;
-RunBench("delimited_u16", "cs15/fast", DelimOps, 4, () => BenchDelimitedFast(delimRing, DelimOps));
-RunBench("delimited_u16", "cs15/struct", DelimOps, 4, () => BenchDelimitedStruct(delimRing, DelimOps));
-RunBench("delimited_u16", "cs15/comb", DelimOps, 4, () => BenchDelimitedCombinator(delimRing, DelimOps));
+RunBench("delimited_u16", "cs15/try", DelimOps, 4, ops => BenchDelimitedTry(delimRing, ops));
+RunBench("delimited_u16", "cs15/fast", DelimOps, 4, ops => BenchDelimitedFast(delimRing, ops));
+RunBench("delimited_u16", "cs15/struct", DelimOps, 4, ops => BenchDelimitedStruct(delimRing, ops));
+RunBench("delimited_u16", "cs15/comb", DelimOps, 4, ops => BenchDelimitedCombinator(delimRing, ops));
 
 // 3. VarInt stream (32 varints per op)
 const int VarIntOps = 200_000;
-RunBench("varint_stream32", "cs15/fast", VarIntOps, varintAvgBytes, () => BenchVarIntFast(varintRing, VarIntOps));
-RunBench("varint_stream32", "cs15/spanforge", VarIntOps, varintAvgBytes, () => BenchVarInt(varintRing, VarIntOps));
+RunBench("varint_stream32", "cs15/try", VarIntOps, varintAvgBytes, ops => BenchVarIntTry(varintRing, ops));
+RunBench("varint_stream32", "cs15/fast", VarIntOps, varintAvgBytes, ops => BenchVarIntFast(varintRing, ops));
+RunBench("varint_stream32", "cs15/spanforge", VarIntOps, varintAvgBytes, ops => BenchVarInt(varintRing, ops));
 
-// 4. TLV stream (16 mixed-tag items per op with Alt + non-boxing [Union] TlvValue)
+// 4. TLV stream (16 mixed-tag items per op with FoldDispatch / Dispatch / Alt + non-boxing [Union] TlvValue)
 const int TlvOps = 200_000;
-RunBench("tlv_stream16", "cs15/fast", TlvOps, tlvBytes, () => BenchTlvFast(tlvRing, TlvOps));
-RunBench("tlv_stream16", "cs15/struct", TlvOps, tlvBytes, () => BenchTlvStruct(tlvRing, TlvOps));
-RunBench("tlv_stream16", "cs15/comb", TlvOps, tlvBytes, () => BenchTlv(tlvRing, TlvOps));
+RunBench("tlv_stream16", "cs15/fold", TlvOps, tlvBytes, ops => BenchTlvFold(tlvRing, ops));
+RunBench("tlv_stream16", "cs15/dispatch", TlvOps, tlvBytes, ops => BenchTlvDispatch(tlvRing, ops));
+RunBench("tlv_stream16", "cs15/try", TlvOps, tlvBytes, ops => BenchTlvTry(tlvRing, ops));
+RunBench("tlv_stream16", "cs15/fast", TlvOps, tlvBytes, ops => BenchTlvFast(tlvRing, ops));
+RunBench("tlv_stream16", "cs15/struct", TlvOps, tlvBytes, ops => BenchTlvStruct(tlvRing, ops));
+RunBench("tlv_stream16", "cs15/comb", TlvOps, tlvBytes, ops => BenchTlv(tlvRing, ops));
 
-// 5. PNG full document + CRC-32 (zero-boxing custom [Union] PngChunk + slicing-by-8 CRC-32)
+// 5. PNG full document + CRC-32 (zero-boxing custom [Union] PngChunk + flat slicing-by-8+4 CRC-32)
 const int PngOps = 200_000;
-RunBench("png_chunks_crc", "cs15/spanforge", PngOps, pngBytes, () => BenchPng(pngRing, PngOps));
+RunBench("png_chunks_crc", "cs15/spanforge", PngOps, pngBytes, ops => BenchPng(pngRing, ops));
 
 return;
 
@@ -238,19 +248,19 @@ static ulong BenchWs(byte[][] ring, int ops)
 
     for (int iter = 0; iter < ops; iter++)
     {
-        byte[] buf = ring[iter & 255];
-        var cursor = buf.AsCursor();
+        ReadOnlySpan<byte> span = ring[iter & 255];
+        var cursor = span.AsCursor();
         var frame = WebSocketFrameParser.ParseFrame(ref cursor).Unwrap();
-        ulong contrib = frame switch
+        (ulong w, Option<uint> m, ByteSlice p) = frame switch
         {
-            TextFrame(_, var m, var p) => 1UL + UnmaskSum(buf, p, m, scratch),
-            BinaryFrame(_, var m, var p) => 2UL + UnmaskSum(buf, p, m, scratch),
-            PingFrame(var m, var p) => 3UL + UnmaskSum(buf, p, m, scratch),
-            PongFrame(var m, var p) => 4UL + UnmaskSum(buf, p, m, scratch),
-            CloseFrame(var m, _, var p) => 5UL + UnmaskSum(buf, p, m, scratch),
-            ContinuationFrame(_, var m, var p) => 6UL + UnmaskSum(buf, p, m, scratch),
+            TextFrame(_, var mk, var pl) => (1UL, mk, pl),
+            BinaryFrame(_, var mk, var pl) => (2UL, mk, pl),
+            PingFrame(var mk, var pl) => (3UL, mk, pl),
+            PongFrame(var mk, var pl) => (4UL, mk, pl),
+            CloseFrame(var mk, _, var pl) => (5UL, mk, pl),
+            ContinuationFrame(_, var mk, var pl) => (6UL, mk, pl),
         };
-        acc = unchecked(acc + contrib);
+        acc = unchecked(acc + w + UnmaskSum(span, p, m, scratch));
     }
 
     return acc;
@@ -385,7 +395,20 @@ static ulong BenchTlv(byte[][] ring, int ops)
 static ulong SumBytes(ReadOnlySpan<byte> s)
 {
     ulong sum = 0;
-    for (int i = 0; i < s.Length; i++) sum += s[i];
+    ref byte r = ref MemoryMarshal.GetReference(s);
+    int i = 0;
+    int len = s.Length;
+    while (i + 8 <= len)
+    {
+        sum += (ulong)(Unsafe.Add(ref r, i) + Unsafe.Add(ref r, i + 1) + Unsafe.Add(ref r, i + 2) + Unsafe.Add(ref r, i + 3)
+             + Unsafe.Add(ref r, i + 4) + Unsafe.Add(ref r, i + 5) + Unsafe.Add(ref r, i + 6) + Unsafe.Add(ref r, i + 7));
+        i += 8;
+    }
+    while (i < len)
+    {
+        sum += Unsafe.Add(ref r, i);
+        i++;
+    }
     return sum;
 }
 
@@ -529,6 +552,142 @@ static ulong BenchTlvFast(byte[][] ring, int ops)
     return acc;
 }
 
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchWsTry(byte[][] ring, int ops)
+{
+    Span<byte> scratch = stackalloc byte[32];
+    ulong acc = 0;
+
+    for (int iter = 0; iter < ops; iter++)
+    {
+        ReadOnlySpan<byte> span = ring[iter & 255];
+        var cursor = span.AsCursor();
+        if (WebSocketFrameParser.TryParseFrame(ref cursor, out var frame).IsParsed)
+        {
+            (ulong w, Option<uint> m, ByteSlice p) = frame switch
+            {
+                TextFrame(_, var mk, var pl) => (1UL, mk, pl),
+                BinaryFrame(_, var mk, var pl) => (2UL, mk, pl),
+                PingFrame(var mk, var pl) => (3UL, mk, pl),
+                PongFrame(var mk, var pl) => (4UL, mk, pl),
+                CloseFrame(var mk, _, var pl) => (5UL, mk, pl),
+                ContinuationFrame(_, var mk, var pl) => (6UL, mk, pl),
+            };
+            acc = unchecked(acc + w + UnmaskSum(span, p, m, scratch));
+        }
+    }
+
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchDelimitedTry(byte[][] ring, int ops)
+{
+    var parser = TryParsers.Delimited<
+        TryParsers.TagByteParser,
+        TryParsers.U16BEParser,
+        TryParsers.TagByteParser,
+        byte, ushort, byte>(
+        TryParsers.TagByte((byte)'['),
+        TryParsers.U16BE,
+        TryParsers.TagByte((byte)']'));
+
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var c = ring[iter & 255].AsCursor();
+        if (parser.TryParse(ref c, out ushort v).IsParsed)
+        {
+            acc = unchecked(acc + v);
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchVarIntTry(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var c = ring[iter & 255].AsCursor();
+        while (!c.IsAtEnd)
+        {
+            if (c.TryReadVarUInt64(out ulong v).IsParsed)
+            {
+                acc = unchecked(acc + v);
+            }
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchTlvTry(byte[][] ring, int ops)
+{
+    var parser = TryParsers.Alt<TryTlvU32Parser, TryTlvF64Parser, TryTlvBytesParser, TlvValue>(default, default, default);
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & 255];
+        ReadOnlySpan<byte> span = buf;
+        var c = span.AsCursor();
+        while (!c.IsAtEnd)
+        {
+            if (parser.TryParse(ref c, out TlvValue val).IsParsed)
+            {
+                ulong add = val switch
+                {
+                    TlvU32(var v) => v,
+                    TlvF64(var d) => BitConverter.DoubleToUInt64Bits(d),
+                    TlvBytes(var slice) => SumBytes(span[slice]),
+                };
+                acc = unchecked(acc + add);
+            }
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchTlvDispatch(byte[][] ring, int ops)
+{
+    var parser = TryParsers.Dispatch<byte, TryParsers.U8Parser, TryTlvDispatchHandler, TlvValue>(TryParsers.U8, default);
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & 255];
+        ReadOnlySpan<byte> span = buf;
+        var c = span.AsCursor();
+        while (!c.IsAtEnd)
+        {
+            if (parser.TryParse(ref c, out TlvValue val).IsParsed)
+            {
+                ulong add = val switch
+                {
+                    TlvU32(var v) => v,
+                    TlvF64(var d) => BitConverter.DoubleToUInt64Bits(d),
+                    TlvBytes(var slice) => SumBytes(span[slice]),
+                };
+                acc = unchecked(acc + add);
+            }
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchTlvFold(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var c = ring[iter & 255].AsCursor();
+        _ = TryParsers.FoldDispatch<byte, TryParsers.U8Parser, TryTlvFolder, ulong>(ref c, TryParsers.U8, default, ref acc);
+    }
+    return acc;
+}
+
 // Non-boxing custom C# 15 [Union] for TLV hot-path comparison
 public readonly record struct TlvU32(uint Value);
 public readonly record struct TlvF64(double Value);
@@ -586,11 +745,10 @@ public readonly struct TlvU32Parser : IParser<TlvValue>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte(0x01);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadU32BE();
-        if (!v.TryGetValue(out Parsed<uint> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<uint> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvU32(ok.Value));
     }
 }
@@ -600,11 +758,10 @@ public readonly struct TlvF64Parser : IParser<TlvValue>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte(0x02);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadF64BE();
-        if (!v.TryGetValue(out Parsed<double> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<double> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvF64(ok.Value));
     }
 }
@@ -614,11 +771,10 @@ public readonly struct TlvBytesParser : IParser<TlvValue>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte(0x03);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadLengthPrefixedBytes(LengthPrefix.U16);
-        if (!v.TryGetValue(out Parsed<ByteSlice> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<ByteSlice> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvBytes(ok.Value));
     }
 }
@@ -628,11 +784,10 @@ public readonly struct FastTlvU32Parser : IParser<TlvValue, NoError>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte<NoError>(0x01);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadU32BE<NoError>();
-        if (!v.TryGetValue(out Parsed<uint> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<uint> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvU32(ok.Value));
     }
 }
@@ -642,11 +797,10 @@ public readonly struct FastTlvF64Parser : IParser<TlvValue, NoError>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte<NoError>(0x02);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadF64BE<NoError>();
-        if (!v.TryGetValue(out Parsed<double> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<double> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvF64(ok.Value));
     }
 }
@@ -656,11 +810,125 @@ public readonly struct FastTlvBytesParser : IParser<TlvValue, NoError>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<TlvValue, NoError> Parse(ref ByteCursor c)
     {
-        var cp = c.Save();
         var t = c.TagByte<NoError>(0x03);
         if (!t.IsParsed) return t.PropagateNonParsed<TlvValue>();
         var v = c.ReadLengthPrefixedBytes<NoError>(LengthPrefix.U16);
-        if (!v.TryGetValue(out Parsed<ByteSlice> ok)) { c.Reset(cp); return v.PropagateNonParsed<TlvValue>(); }
+        if (!v.TryGetValue(out Parsed<ByteSlice> ok)) return v.PropagateNonParsed<TlvValue>();
         return new Parsed<TlvValue>(new TlvBytes(ok.Value));
+    }
+}
+
+public readonly struct TryTlvU32Parser : ITryParser<TlvValue>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public FastStatus TryParse(ref ByteCursor c, out TlvValue value)
+    {
+        var t = c.TryTagByte(0x01, out _);
+        if (!t.IsParsed) { Unsafe.SkipInit(out value); return t; }
+        var v = c.TryReadU32BE(out uint u);
+        if (!v.IsParsed) { Unsafe.SkipInit(out value); return v; }
+        value = new TlvU32(u);
+        return FastStatus.Parsed;
+    }
+}
+
+public readonly struct TryTlvF64Parser : ITryParser<TlvValue>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public FastStatus TryParse(ref ByteCursor c, out TlvValue value)
+    {
+        var t = c.TryTagByte(0x02, out _);
+        if (!t.IsParsed) { Unsafe.SkipInit(out value); return t; }
+        var v = c.TryReadF64BE(out double d);
+        if (!v.IsParsed) { Unsafe.SkipInit(out value); return v; }
+        value = new TlvF64(d);
+        return FastStatus.Parsed;
+    }
+}
+
+public readonly struct TryTlvBytesParser : ITryParser<TlvValue>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public FastStatus TryParse(ref ByteCursor c, out TlvValue value)
+    {
+        var t = c.TryTagByte(0x03, out _);
+        if (!t.IsParsed) { Unsafe.SkipInit(out value); return t; }
+        var v = c.TryReadLengthPrefixedU16BE(out ByteSlice s);
+        if (!v.IsParsed) { Unsafe.SkipInit(out value); return v; }
+        value = new TlvBytes(s);
+        return FastStatus.Parsed;
+    }
+}
+
+public readonly struct TryTlvDispatchHandler : ITryDispatchHandler<byte, TlvValue>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public FastStatus TryParse(byte tag, ref ByteCursor c, out TlvValue value)
+    {
+        if (tag == 0x01)
+        {
+            var u = c.TryReadU32BE(out uint u32);
+            if (!u.IsParsed) { Unsafe.SkipInit(out value); return u; }
+            value = new TlvU32(u32);
+            return FastStatus.Parsed;
+        }
+        if (tag == 0x02)
+        {
+            var f = c.TryReadF64BE(out double f64);
+            if (!f.IsParsed) { Unsafe.SkipInit(out value); return f; }
+            value = new TlvF64(f64);
+            return FastStatus.Parsed;
+        }
+        if (tag == 0x03)
+        {
+            var s = c.TryReadLengthPrefixedU16BE(out ByteSlice slice);
+            if (!s.IsParsed) { Unsafe.SkipInit(out value); return s; }
+            value = new TlvBytes(slice);
+            return FastStatus.Parsed;
+        }
+        Unsafe.SkipInit(out value);
+        return FastStatus.Backtrack;
+    }
+}
+
+public readonly struct TryTlvFolder : ITryDispatchFolder<byte, ulong>
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public FastStatus TryFold(byte tag, ref ByteCursor c, ref ulong acc)
+    {
+        if (tag == 0x01)
+        {
+            var u = c.TryReadU32BE(out uint u32);
+            if (!u.IsParsed) return u;
+            acc = unchecked(acc + u32);
+            return FastStatus.Parsed;
+        }
+        if (tag == 0x02)
+        {
+            var f = c.TryReadF64BE(out double f64);
+            if (!f.IsParsed) return f;
+            acc = unchecked(acc + BitConverter.DoubleToUInt64Bits(f64));
+            return FastStatus.Parsed;
+        }
+        if (tag == 0x03)
+        {
+            var s = c.TryReadLengthPrefixedU16BE(out ByteSlice slice);
+            if (!s.IsParsed) return s;
+            ReadOnlySpan<byte> payload = c.Buffer.Slice(slice.Offset, slice.Length);
+            ulong sum = 0;
+            ref byte r = ref MemoryMarshal.GetReference(payload);
+            int i = 0;
+            int len = payload.Length;
+            while (i + 8 <= len)
+            {
+                sum += (ulong)(Unsafe.Add(ref r, i) + Unsafe.Add(ref r, i + 1) + Unsafe.Add(ref r, i + 2) + Unsafe.Add(ref r, i + 3)
+                     + Unsafe.Add(ref r, i + 4) + Unsafe.Add(ref r, i + 5) + Unsafe.Add(ref r, i + 6) + Unsafe.Add(ref r, i + 7));
+                i += 8;
+            }
+            while (i < len) { sum += Unsafe.Add(ref r, i); i++; }
+            acc = unchecked(acc + sum);
+            return FastStatus.Parsed;
+        }
+        return FastStatus.Backtrack;
     }
 }

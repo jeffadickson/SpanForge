@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace SpanForge;
 
@@ -53,7 +54,7 @@ public ref struct BitCursor
     public void Reset(BitCheckpoint checkpoint) => _bitPosition = checkpoint.BitPosition;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private readonly ParseResult<T> BitShortage<T>(int requiredBits) =>
+    internal readonly ParseResult<T> BitShortage<T>(int requiredBits) =>
         BitShortageCore<T>(_mode, CurrentByteOffset, RemainingBits, requiredBits);
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -67,13 +68,62 @@ public ref struct BitCursor
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryReadBool(out bool value)
+    {
+        int bitPos = _bitPosition;
+        if ((_buffer.Length << 3) - bitPos < 1)
+        {
+            value = false;
+            return false;
+        }
+
+        byte b = Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)(bitPos >> 3));
+        value = ((b >> (7 - (bitPos & 7))) & 1) != 0;
+        _bitPosition = bitPos + 1;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryReadU8(int bitCount, out byte value)
+    {
+        int bitPos = _bitPosition;
+        if ((uint)bitCount > 8u || (_buffer.Length << 3) - bitPos < bitCount)
+        {
+            value = 0;
+            return false;
+        }
+
+        if (bitCount == 0)
+        {
+            value = 0;
+            return true;
+        }
+
+        int byteIdx = bitPos >> 3;
+        int bitOffset = bitPos & 7;
+        int availInByte = 8 - bitOffset;
+        ref byte p = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)byteIdx);
+
+        if (bitCount <= availInByte)
+        {
+            value = (byte)((p >> (availInByte - bitCount)) & ((1 << bitCount) - 1));
+        }
+        else
+        {
+            int nextBits = bitCount - availInByte;
+            int hi = p & ((1 << availInByte) - 1);
+            int lo = Unsafe.Add(ref p, 1) >> (8 - nextBits);
+            value = (byte)((hi << nextBits) | lo);
+        }
+
+        _bitPosition = bitPos + bitCount;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<bool> ReadBool()
     {
-        if (RemainingBits < 1) return BitShortage<bool>(1);
-        int byteIdx = _bitPosition >> 3;
-        int bitShift = 7 - (_bitPosition & 7);
-        bool value = ((_buffer[byteIdx] >> bitShift) & 1) != 0;
-        _bitPosition++;
+        if (!TryReadBool(out bool value)) return BitShortage<bool>(1);
         return new Parsed<bool>(value);
     }
 
@@ -83,28 +133,7 @@ public ref struct BitCursor
         if ((uint)bitCount > 8u)
             return Backtrack.At(CurrentByteOffset, ErrorKind.BitRead, "bitCount must be in [0..8]");
 
-        if (bitCount == 0) return new Parsed<byte>(0);
-        if (RemainingBits < bitCount) return BitShortage<byte>(bitCount);
-
-        int byteIdx = _bitPosition >> 3;
-        int bitOffset = _bitPosition & 7;
-        int availInByte = 8 - bitOffset;
-
-        byte value;
-        if (bitCount <= availInByte)
-        {
-            int shift = availInByte - bitCount;
-            value = (byte)((_buffer[byteIdx] >> shift) & ((1 << bitCount) - 1));
-        }
-        else
-        {
-            int nextBits = bitCount - availInByte;
-            int hi = _buffer[byteIdx] & ((1 << availInByte) - 1);
-            int lo = _buffer[byteIdx + 1] >> (8 - nextBits);
-            value = (byte)((hi << nextBits) | lo);
-        }
-
-        _bitPosition += bitCount;
+        if (!TryReadU8(bitCount, out byte value)) return BitShortage<byte>(bitCount);
         return new Parsed<byte>(value);
     }
 

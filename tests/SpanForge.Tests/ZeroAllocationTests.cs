@@ -34,7 +34,7 @@ internal static class ZeroAllocationTests
         Assert.Equal(10_000L * 0x1234, sum);
         Assert.Equal(0L, allocated);
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         static long RunLoop<TP>(byte[] buf, TP p, int iterations) where TP : struct, IParser<ushort>
         {
             long acc = 0;
@@ -67,7 +67,7 @@ internal static class ZeroAllocationTests
         Assert.Equal(10_000L * 72, sum);
         Assert.Equal(0L, allocated);
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         static long RunLoop(byte[] buf, int iterations)
         {
             Span<byte> scratch = stackalloc byte[8];
@@ -113,7 +113,7 @@ internal static class ZeroAllocationTests
         Assert.Equal(10_000L * ('H' + 'e' + 'l' + 'l' + 'o'), checksum);
         Assert.Equal(0L, allocated);
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         static long RunLoop(byte[] buf, int iterations)
         {
             Span<byte> unmasked = stackalloc byte[16];

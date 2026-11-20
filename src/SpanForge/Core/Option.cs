@@ -33,7 +33,11 @@ public readonly struct Option<T> : IUnion, IEquatable<Option<T>>
         _tag = 2;
     }
 
-    public static Option<T> Nothing => new(default(None));
+    public static Option<T> Nothing
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => new(default(None));
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Option<T> Of(T value) => new(new Some<T>(value));
@@ -45,9 +49,23 @@ public readonly struct Option<T> : IUnion, IEquatable<Option<T>>
         _ => null,
     };
 
-    public bool HasValue => _tag != 0;
-    public bool IsSome => _tag == 1;
-    public bool IsNone => _tag != 1;
+    public bool HasValue
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _tag != 0;
+    }
+
+    public bool IsSome
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _tag == 1;
+    }
+
+    public bool IsNone
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _tag != 1;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out Some<T> value)

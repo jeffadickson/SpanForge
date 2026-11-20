@@ -53,23 +53,61 @@ public ref partial struct ByteCursor
         _mode = mode;
     }
 
-    public readonly ReadOnlySpan<byte> Buffer => _buffer;
-    public readonly ReadOnlySpan<byte> Remaining => _buffer[_position..];
-    public readonly int Length => _buffer.Length;
-    public readonly int RemainingLength => _buffer.Length - _position;
-    public readonly bool IsAtEnd => _position >= _buffer.Length;
-    public readonly InputMode Mode => _mode;
+    public readonly ReadOnlySpan<byte> Buffer
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _buffer;
+    }
+
+    public readonly ReadOnlySpan<byte> Remaining
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _buffer[_position..];
+    }
+
+    public readonly int Length
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _buffer.Length;
+    }
+
+    public readonly int RemainingLength
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _buffer.Length - _position;
+    }
+
+    public readonly bool IsAtEnd
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _position >= _buffer.Length;
+    }
+
+    public readonly InputMode Mode
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _mode;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void Rewind(int position) => _position = position;
 
     public int Position
     {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         readonly get => _position;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         set
         {
-            ArgumentOutOfRangeException.ThrowIfNegative(value);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, _buffer.Length);
+            if ((uint)value > (uint)_buffer.Length) ThrowPositionOutOfRange();
             _position = value;
         }
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowPositionOutOfRange() =>
+        throw new ArgumentOutOfRangeException("value");
 
     public Endianness Endianness
     {
@@ -135,8 +173,10 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<byte> ReadU8()
     {
-        if (RemainingLength < 1) return Shortage<byte>(1);
-        return new Parsed<byte>(_buffer[_position++]);
+        int pos = _position;
+        if (pos >= _buffer.Length) return Shortage<byte>(1);
+        _position = pos + 1;
+        return new Parsed<byte>(Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -163,18 +203,22 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ushort> ReadU16BE()
     {
-        if (RemainingLength < 2) return Shortage<ushort>(2);
-        ushort value = BinaryPrimitives.ReadUInt16BigEndian(_buffer.Slice(_position, 2));
-        _position += 2;
+        int pos = _position;
+        if (_buffer.Length - pos < 2) return Shortage<ushort>(2);
+        ushort value = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 2;
         return new Parsed<ushort>(value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ushort> ReadU16LE()
     {
-        if (RemainingLength < 2) return Shortage<ushort>(2);
-        ushort value = BinaryPrimitives.ReadUInt16LittleEndian(_buffer.Slice(_position, 2));
-        _position += 2;
+        int pos = _position;
+        if (_buffer.Length - pos < 2) return Shortage<ushort>(2);
+        ushort value = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (!BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 2;
         return new Parsed<ushort>(value);
     }
 
@@ -233,18 +277,22 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<uint> ReadU32BE()
     {
-        if (RemainingLength < 4) return Shortage<uint>(4);
-        uint value = BinaryPrimitives.ReadUInt32BigEndian(_buffer.Slice(_position, 4));
-        _position += 4;
+        int pos = _position;
+        if (_buffer.Length - pos < 4) return Shortage<uint>(4);
+        uint value = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 4;
         return new Parsed<uint>(value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<uint> ReadU32LE()
     {
-        if (RemainingLength < 4) return Shortage<uint>(4);
-        uint value = BinaryPrimitives.ReadUInt32LittleEndian(_buffer.Slice(_position, 4));
-        _position += 4;
+        int pos = _position;
+        if (_buffer.Length - pos < 4) return Shortage<uint>(4);
+        uint value = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (!BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 4;
         return new Parsed<uint>(value);
     }
 
@@ -277,18 +325,22 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ulong> ReadU64BE()
     {
-        if (RemainingLength < 8) return Shortage<ulong>(8);
-        ulong value = BinaryPrimitives.ReadUInt64BigEndian(_buffer.Slice(_position, 8));
-        _position += 8;
+        int pos = _position;
+        if (_buffer.Length - pos < 8) return Shortage<ulong>(8);
+        ulong value = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 8;
         return new Parsed<ulong>(value);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ulong> ReadU64LE()
     {
-        if (RemainingLength < 8) return Shortage<ulong>(8);
-        ulong value = BinaryPrimitives.ReadUInt64LittleEndian(_buffer.Slice(_position, 8));
-        _position += 8;
+        int pos = _position;
+        if (_buffer.Length - pos < 8) return Shortage<ulong>(8);
+        ulong value = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (!BitConverter.IsLittleEndian) value = BinaryPrimitives.ReverseEndianness(value);
+        _position = pos + 8;
         return new Parsed<ulong>(value);
     }
 
@@ -376,19 +428,23 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<double> ReadF64BE()
     {
-        if (RemainingLength < 8) return Shortage<double>(8);
-        double value = BinaryPrimitives.ReadDoubleBigEndian(_buffer.Slice(_position, 8));
-        _position += 8;
-        return new Parsed<double>(value);
+        int pos = _position;
+        if (_buffer.Length - pos < 8) return Shortage<double>(8);
+        ulong bits = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (BitConverter.IsLittleEndian) bits = BinaryPrimitives.ReverseEndianness(bits);
+        _position = pos + 8;
+        return new Parsed<double>(BitConverter.UInt64BitsToDouble(bits));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<double> ReadF64LE()
     {
-        if (RemainingLength < 8) return Shortage<double>(8);
-        double value = BinaryPrimitives.ReadDoubleLittleEndian(_buffer.Slice(_position, 8));
-        _position += 8;
-        return new Parsed<double>(value);
+        int pos = _position;
+        if (_buffer.Length - pos < 8) return Shortage<double>(8);
+        ulong bits = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos));
+        if (!BitConverter.IsLittleEndian) bits = BinaryPrimitives.ReverseEndianness(bits);
+        _position = pos + 8;
+        return new Parsed<double>(BitConverter.UInt64BitsToDouble(bits));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -401,55 +457,78 @@ public ref partial struct ByteCursor
 
     /// <summary>
     /// Reads an unsigned LEB128 varint (up to 64 bits / 10 bytes, as used in Protobuf, WASM, and DWARF).
+    /// Uses a single-bounds-check unrolled fast path when at least 10 bytes remain.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ulong> ReadVarUInt64()
     {
-        int start = _position;
+        int pos = _position;
+        if (_buffer.Length - pos >= 10)
+        {
+            ref byte p = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos);
+            ulong b = p;
+            if (b < 0x80) { _position = pos + 1; return new Parsed<ulong>(b); }
+            ulong result = b & 0x7F;
+            b = Unsafe.Add(ref p, 1); result |= (b & 0x7F) << 7; if (b < 0x80) { _position = pos + 2; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 2); result |= (b & 0x7F) << 14; if (b < 0x80) { _position = pos + 3; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 3); result |= (b & 0x7F) << 21; if (b < 0x80) { _position = pos + 4; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 4); result |= (b & 0x7F) << 28; if (b < 0x80) { _position = pos + 5; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 5); result |= (b & 0x7F) << 35; if (b < 0x80) { _position = pos + 6; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 6); result |= (b & 0x7F) << 42; if (b < 0x80) { _position = pos + 7; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 7); result |= (b & 0x7F) << 49; if (b < 0x80) { _position = pos + 8; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 8); result |= (b & 0x7F) << 56; if (b < 0x80) { _position = pos + 9; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 9);
+            if (b <= 1) { _position = pos + 10; return new Parsed<ulong>(result | (b << 63)); }
+            return VarIntOverflow(pos, b);
+        }
+
+        var slowRes = ReadVarUInt64Slow(_buffer, pos, _mode, out int nextPos);
+        if (slowRes.IsParsed) _position = nextPos;
+        return slowRes;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<ulong> VarIntOverflow(int start, ulong tenthByte) =>
+        Backtrack.At(
+            start,
+            ErrorKind.VarInt,
+            (tenthByte & 0x80) != 0 ? "LEB128 varint exceeds 10 bytes" : "LEB128 varint overflows UInt64");
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<ulong> ReadVarUInt64Slow(ReadOnlySpan<byte> buf, int start, InputMode mode, out int nextPos)
+    {
         int pos = start;
-        ReadOnlySpan<byte> buf = _buffer;
-        if ((uint)pos >= (uint)buf.Length)
-        {
-            return _mode == InputMode.Streaming
-                ? Incomplete.AtLeast(1)
-                : Backtrack.At(start, ErrorKind.Eof, "Unexpected EOF inside LEB128 varint");
-        }
+        ulong result = 0;
+        int shift = 0;
 
-        byte b = buf[pos++];
-        if (b < 0x80)
-        {
-            _position = pos;
-            return new Parsed<ulong>(b);
-        }
-
-        ulong result = (ulong)(b & 0x7F);
-        int shift = 7;
-
-        for (int i = 1; i < 10; i++)
+        for (int i = 0; i < 10; i++)
         {
             if ((uint)pos >= (uint)buf.Length)
             {
-                return _mode == InputMode.Streaming
+                nextPos = start;
+                return mode == InputMode.Streaming
                     ? Incomplete.AtLeast(1)
                     : Backtrack.At(start, ErrorKind.Eof, "Unexpected EOF inside LEB128 varint");
             }
 
-            b = buf[pos++];
+            byte b = buf[pos++];
             if (i == 9 && b > 1)
             {
-                return Backtrack.At(start, ErrorKind.VarInt, "LEB128 varint overflows UInt64");
+                nextPos = start;
+                return VarIntOverflow(start, b);
             }
 
             result |= (ulong)(b & 0x7F) << shift;
             if ((b & 0x80) == 0)
             {
-                _position = pos;
+                nextPos = pos;
                 return new Parsed<ulong>(result);
             }
 
             shift += 7;
         }
 
+        nextPos = start;
         return Backtrack.At(start, ErrorKind.VarInt, "LEB128 varint exceeds 10 bytes");
     }
 
@@ -528,9 +607,11 @@ public ref partial struct ByteCursor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<byte> TagByte(byte expected)
     {
-        if (RemainingLength < 1) return Shortage<byte>(1, ErrorKind.Tag);
-        if (_buffer[_position] != expected) return Backtrack.At(_position, ErrorKind.Tag);
-        _position++;
+        int pos = _position;
+        if (pos >= _buffer.Length) return Shortage<byte>(1, ErrorKind.Tag);
+        if (Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos) != expected)
+            return Backtrack.At(pos, ErrorKind.Tag);
+        _position = pos + 1;
         return new Parsed<byte>(expected);
     }
 
@@ -753,6 +834,7 @@ public ref partial struct ByteCursor
     /// <summary>
     /// Reads a length-prefixed binary slice in one step (equivalent to <c>nom::multi::length_data</c>).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ParseResult<ByteSlice> ReadLengthPrefixedBytes(LengthPrefix prefix)
     {
         var cp = Save();

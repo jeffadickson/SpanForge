@@ -4,4 +4,7 @@
     <RootNamespace>SpanForge</RootNamespace>
     <Description>A zero-allocation, C# 15 union-powered Span and binary parser combinator library inspired by Rust's nom, winnow, binrw, and zerocopy.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="SpanForge.Protocols" />
+  </ItemGroup>
 </Project>

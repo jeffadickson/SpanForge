@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace SpanForge.Protocols.Png;
 
@@ -163,7 +164,7 @@ public static class PngParser
     private const uint TypeText = 0x74455874; // "tEXt"
     private const uint TypeIend = 0x49454E44; // "IEND"
 
-    private static readonly uint[][] CrcTables = BuildCrcTables();
+    private static readonly uint[] CrcTableFlat = BuildCrcTableFlat();
 
     public static ParseResult<ByteSlice> ParseSignature(ref ByteCursor cursor) =>
         cursor.Tag(Signature).WithContext("PNG 8-byte magic signature");
@@ -171,163 +172,159 @@ public static class PngParser
     /// <summary>
     /// Parses a single PNG chunk (works in both <see cref="InputMode.Complete"/> and <see cref="InputMode.Streaming"/>).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ParseResult<PngChunk> ParseChunk(ref ByteCursor cursor)
     {
-        var cp = cursor.Save();
-        cursor.Endianness = Endianness.Big;
-
-        var lenRes = cursor.ReadU32BE();
-        if (!lenRes.TryGetValue(out Parsed<uint> lenOk))
+        int start = cursor.Position;
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        int rem = buf.Length - start;
+        if (rem < 12)
         {
-            cursor.Reset(cp);
-            return lenRes.PropagateNonParsed<PngChunk>();
+            return ParseChunkShortage(ref cursor, start, rem);
         }
 
-        if (lenOk.Value > int.MaxValue - 12)
+        ref byte ptr = ref Unsafe.Add(ref MemoryMarshal.GetReference(buf), (nint)(uint)start);
+        uint rawLen = Unsafe.ReadUnaligned<uint>(ref ptr);
+        uint typeCode = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ptr, 4));
+        if (BitConverter.IsLittleEndian)
         {
-            cursor.Reset(cp);
-            return Failure.At(cp.Position, ErrorKind.LengthValue, "PNG chunk length exceeds safe limit");
+            rawLen = BinaryPrimitives.ReverseEndianness(rawLen);
+            typeCode = BinaryPrimitives.ReverseEndianness(typeCode);
         }
 
-        int dataLength = (int)lenOk.Value;
-        int typeStart = cursor.Position;
-
-        var typeRes = cursor.ReadU32BE();
-        if (!typeRes.TryGetValue(out Parsed<uint> typeOk))
+        if (rawLen > int.MaxValue - 12)
         {
-            cursor.Reset(cp);
-            return typeRes.PropagateNonParsed<PngChunk>();
+            return Failure.At(start, ErrorKind.LengthValue, "PNG chunk length exceeds safe limit");
         }
 
-        var dataRes = cursor.Take(dataLength);
-        if (!dataRes.TryGetValue(out Parsed<ByteSlice> dataOk))
+        int dataLength = (int)rawLen;
+        int totalLength = 12 + dataLength;
+        if (rem < totalLength)
         {
-            cursor.Reset(cp);
-            return dataRes.PropagateNonParsed<PngChunk>();
+            return cursor.Mode == InputMode.Streaming
+                ? Incomplete.AtLeast(totalLength - rem)
+                : Backtrack.At(start + 8, ErrorKind.Take);
         }
 
-        int crcOffset = cursor.Position;
-        var crcRes = cursor.ReadU32BE();
-        if (!crcRes.TryGetValue(out Parsed<uint> crcOk))
+        int crcOffset = start + 8 + dataLength;
+        uint expectedCrc = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ptr, (nint)(uint)(8 + dataLength)));
+        if (BitConverter.IsLittleEndian)
         {
-            cursor.Reset(cp);
-            return crcRes.PropagateNonParsed<PngChunk>();
+            expectedCrc = BinaryPrimitives.ReverseEndianness(expectedCrc);
         }
 
         // Verify IEEE 802.3 CRC-32 over [ChunkType (4 bytes) || ChunkData].
-        ReadOnlySpan<byte> crcSpan = cursor.Buffer.Slice(typeStart, 4 + dataLength);
-        uint computedCrc = ComputeCrc32(crcSpan);
-        if (computedCrc != crcOk.Value)
+        uint computedCrc = ComputeCrc32(buf.Slice(start + 4, 4 + dataLength));
+        if (computedCrc != expectedCrc)
         {
-            cursor.Reset(cp);
-            return Failure.At(
-                crcOffset,
-                ErrorKind.CrcMismatch,
-                $"PNG chunk CRC mismatch: expected 0x{crcOk.Value:X8}, computed 0x{computedCrc:X8}");
+            return CrcMismatchFailure(crcOffset, expectedCrc, computedCrc);
         }
 
-        var sub = cursor.CreateSubCursor(dataOk.Value, InputMode.Complete);
-        return DecodeChunkPayload(typeOk.Value, dataOk.Value, ref sub) switch
+        var dataSlice = new ByteSlice(start + 8, dataLength);
+        var decoded = DecodeChunkPayload(typeCode, dataSlice, buf.Slice(start + 8, dataLength));
+        if (decoded.IsParsed)
         {
-            Parsed<PngChunk> ok => ok,
-            Incomplete inc => ResetAndReturn(ref cursor, cp, inc),
-            Backtrack err => ResetAndReturn(ref cursor, cp, new Failure(err.Error)),
-            Failure fail => ResetAndReturn(ref cursor, cp, fail),
-        };
-
-        static ParseResult<PngChunk> ResetAndReturn(ref ByteCursor c, Checkpoint checkpoint, ParseResult<PngChunk> res)
-        {
-            c.Reset(checkpoint);
-            return res;
+            cursor.Position = start + totalLength;
         }
+
+        return decoded;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<PngChunk> ParseChunkShortage(ref ByteCursor cursor, int start, int rem)
+    {
+        if (rem >= 4)
+        {
+            uint rawLen = BinaryPrimitives.ReadUInt32BigEndian(cursor.Buffer.Slice(start, 4));
+            if (rawLen > int.MaxValue - 12)
+            {
+                return Failure.At(start, ErrorKind.LengthValue, "PNG chunk length exceeds safe limit");
+            }
+        }
+
+        if (cursor.Mode == InputMode.Streaming)
+        {
+            if (rem < 4) return Incomplete.AtLeast(4 - rem);
+            if (rem < 8) return Incomplete.AtLeast(8 - rem);
+            return Incomplete.AtLeast(12 - rem);
+        }
+
+        return Backtrack.At(start, ErrorKind.Eof);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ParseResult<PngChunk> CrcMismatchFailure(int crcOffset, uint expectedCrc, uint computedCrc) =>
+        Failure.At(
+            crcOffset,
+            ErrorKind.CrcMismatch,
+            $"PNG chunk CRC mismatch: expected 0x{expectedCrc:X8}, computed 0x{computedCrc:X8}");
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ParseResult<PngChunk> DecodeChunkPayload(
         uint typeCode,
         ByteSlice dataSlice,
-        ref ByteCursor sub)
+        ReadOnlySpan<byte> payload)
     {
         switch (typeCode)
         {
             case TypeIhdr:
-                if (dataSlice.Length != 13)
+                if (payload.Length != 13)
                 {
-                    return Failure.At(sub.Position, ErrorKind.Protocol, $"IHDR chunk must be 13 bytes, got {dataSlice.Length}");
+                    return Failure.At(dataSlice.Offset, ErrorKind.Protocol, $"IHDR chunk must be 13 bytes, got {payload.Length}");
                 }
 
-                if (!sub.ReadU32BE().TryGetValue(out Parsed<uint> wOk)
-                    || !sub.ReadU32BE().TryGetValue(out Parsed<uint> hOk)
-                    || !sub.ReadU8().TryGetValue(out Parsed<byte> bdOk)
-                    || !sub.ReadU8().TryGetValue(out Parsed<byte> ctOk)
-                    || !sub.ReadU8().TryGetValue(out Parsed<byte> compOk)
-                    || !sub.ReadU8().TryGetValue(out Parsed<byte> filtOk)
-                    || !sub.ReadU8().TryGetValue(out Parsed<byte> intOk))
-                {
-                    return Failure.At(sub.Position, ErrorKind.Protocol, "Truncated IHDR payload");
-                }
-
-                uint width = wOk.Value;
-                uint height = hOk.Value;
-                byte bitDepth = bdOk.Value;
-                byte colorTypeRaw = ctOk.Value;
-                byte compression = compOk.Value;
-                byte filter = filtOk.Value;
-                byte interlace = intOk.Value;
+                uint width = BinaryPrimitives.ReadUInt32BigEndian(payload);
+                uint height = BinaryPrimitives.ReadUInt32BigEndian(payload.Slice(4, 4));
+                byte bitDepth = payload[8];
+                byte colorTypeRaw = payload[9];
+                byte compression = payload[10];
+                byte filter = payload[11];
+                byte interlace = payload[12];
 
                 if (width == 0 || height == 0)
                 {
                     return Failure.At(dataSlice.Offset, ErrorKind.Verify, "PNG dimensions must be non-zero");
                 }
 
-                if (!Enum.IsDefined((PngColorType)colorTypeRaw))
+                if (colorTypeRaw is not (0 or 2 or 3 or 4 or 6))
                 {
                     return Failure.At(dataSlice.Offset + 9, ErrorKind.Verify, $"Unknown PNG color type {colorTypeRaw}");
                 }
 
-                PngChunk ihdr = new IhdrChunk(width, height, bitDepth, (PngColorType)colorTypeRaw, compression, filter, interlace);
-                return new Parsed<PngChunk>(ihdr);
+                return new Parsed<PngChunk>(new IhdrChunk(width, height, bitDepth, (PngColorType)colorTypeRaw, compression, filter, interlace));
 
             case TypePlte:
-                if (dataSlice.Length == 0 || dataSlice.Length % 3 != 0)
+                if (payload.Length == 0 || payload.Length % 3 != 0)
                 {
                     return Failure.At(dataSlice.Offset, ErrorKind.Protocol, "PLTE chunk length must be a positive multiple of 3");
                 }
 
-                PngChunk plte = new PlteChunk(dataSlice);
-                return new Parsed<PngChunk>(plte);
+                return new Parsed<PngChunk>(new PlteChunk(dataSlice));
 
             case TypeIdat:
-                PngChunk idat = new IdatChunk(dataSlice);
-                return new Parsed<PngChunk>(idat);
+                return new Parsed<PngChunk>(new IdatChunk(dataSlice));
 
             case TypeText:
-                var kwRes = sub.ReadCString();
-                if (!kwRes.TryGetValue(out Parsed<ByteSlice> kwOk))
+                int nul = payload.IndexOf((byte)0);
+                if (nul < 0)
                 {
-                    return Failure.At(sub.Position, ErrorKind.Protocol, "tEXt chunk missing null separator after keyword");
+                    return Failure.At(dataSlice.Offset, ErrorKind.Protocol, "tEXt chunk missing null separator after keyword");
                 }
 
-                var restRes = sub.TakeRest();
-                if (!restRes.TryGetValue(out Parsed<ByteSlice> restOk))
-                {
-                    return restRes.PropagateNonParsed<PngChunk>();
-                }
-
-                PngChunk text = new TextChunk(kwOk.Value, restOk.Value);
-                return new Parsed<PngChunk>(text);
+                var kw = new ByteSlice(dataSlice.Offset, nul);
+                var txt = new ByteSlice(dataSlice.Offset + nul + 1, payload.Length - nul - 1);
+                return new Parsed<PngChunk>(new TextChunk(kw, txt));
 
             case TypeIend:
-                if (dataSlice.Length != 0)
+                if (payload.Length != 0)
                 {
                     return Failure.At(dataSlice.Offset, ErrorKind.Protocol, "IEND chunk must have empty payload");
                 }
 
-                PngChunk iend = default(IendChunk);
-                return new Parsed<PngChunk>(iend);
+                return new Parsed<PngChunk>(default(IendChunk));
 
             default:
-                PngChunk unknown = new UnknownChunk(typeCode, dataSlice);
-                return new Parsed<PngChunk>(unknown);
+                return new Parsed<PngChunk>(new UnknownChunk(typeCode, dataSlice));
         }
     }
 
@@ -380,40 +377,60 @@ public static class PngParser
         return new Parsed<PngDocument>(new PngDocument(header, chunks));
     }
 
-    /// <summary>Computes IEEE 802.3 CRC-32 using safe slicing-by-8 lookup tables (zero allocations).</summary>
+    /// <summary>Computes IEEE 802.3 CRC-32 using flat slicing-by-8+4 lookup tables (zero allocations, zero inner bounds checks).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint ComputeCrc32(ReadOnlySpan<byte> data)
     {
-        uint[][] tables = CrcTables;
-        uint[] t0 = tables[0];
-        uint[] t1 = tables[1];
-        uint[] t2 = tables[2];
-        uint[] t3 = tables[3];
-        uint[] t4 = tables[4];
-        uint[] t5 = tables[5];
-        uint[] t6 = tables[6];
-        uint[] t7 = tables[7];
+        ref uint t = ref MemoryMarshal.GetArrayDataReference(CrcTableFlat);
+        ref byte src = ref MemoryMarshal.GetReference(data);
+        int len = data.Length;
 
         uint crc = 0xFFFF_FFFFu;
-        int i = 0;
-        int end8 = data.Length - 7;
-        while (i < end8)
+        nuint i = 0;
+        nuint uLen = (nuint)(uint)len;
+
+        while (i + 8 <= uLen)
         {
-            uint lo = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i, 4)) ^ crc;
-            uint hi = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i + 4, 4));
-            crc = t7[lo & 0xFF]
-                ^ t6[(lo >> 8) & 0xFF]
-                ^ t5[(lo >> 16) & 0xFF]
-                ^ t4[lo >> 24]
-                ^ t3[hi & 0xFF]
-                ^ t2[(hi >> 8) & 0xFF]
-                ^ t1[(hi >> 16) & 0xFF]
-                ^ t0[hi >> 24];
+            uint lo = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, i));
+            uint hi = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, i + 4));
+            if (!BitConverter.IsLittleEndian)
+            {
+                lo = BinaryPrimitives.ReverseEndianness(lo);
+                hi = BinaryPrimitives.ReverseEndianness(hi);
+            }
+
+            lo ^= crc;
+            crc = Unsafe.Add(ref t, (nint)(7 * 256 + (lo & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(6 * 256 + ((lo >> 8) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(5 * 256 + ((lo >> 16) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(4 * 256 + (lo >> 24)))
+                ^ Unsafe.Add(ref t, (nint)(3 * 256 + (hi & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(2 * 256 + ((hi >> 8) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(1 * 256 + ((hi >> 16) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(hi >> 24));
             i += 8;
         }
 
-        for (; i < data.Length; i++)
+        if (i + 4 <= uLen)
         {
-            crc = t0[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+            uint w = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, i));
+            if (!BitConverter.IsLittleEndian)
+            {
+                w = BinaryPrimitives.ReverseEndianness(w);
+            }
+
+            w ^= crc;
+            crc = Unsafe.Add(ref t, (nint)(3 * 256 + (w & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(2 * 256 + ((w >> 8) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(1 * 256 + ((w >> 16) & 0xFF)))
+                ^ Unsafe.Add(ref t, (nint)(w >> 24));
+            i += 4;
+        }
+
+        while (i < uLen)
+        {
+            crc = Unsafe.Add(ref t, (nint)((crc ^ Unsafe.Add(ref src, i)) & 0xFF)) ^ (crc >> 8);
+            i++;
         }
 
         return ~crc;
@@ -433,15 +450,9 @@ public static class PngParser
         return result;
     }
 
-    private static uint[][] BuildCrcTables()
+    private static uint[] BuildCrcTableFlat()
     {
-        var tables = new uint[8][];
-        for (int t = 0; t < 8; t++)
-        {
-            tables[t] = new uint[256];
-        }
-
-        uint[] t0 = tables[0];
+        var table = new uint[8 * 256];
         for (uint i = 0; i < 256; i++)
         {
             uint c = i;
@@ -450,20 +461,20 @@ public static class PngParser
                 c = (c & 1) != 0 ? 0xEDB8_8320u ^ (c >> 1) : c >> 1;
             }
 
-            t0[i] = c;
+            table[i] = c;
         }
 
-        for (int t = 1; t < 8; t++)
+        for (int s = 1; s < 8; s++)
         {
-            uint[] prev = tables[t - 1];
-            uint[] curr = tables[t];
+            int prevBase = (s - 1) * 256;
+            int currBase = s * 256;
             for (int i = 0; i < 256; i++)
             {
-                uint c = prev[i];
-                curr[i] = (c >> 8) ^ t0[c & 0xFF];
+                uint c = table[prevBase + i];
+                table[currBase + i] = (c >> 8) ^ table[c & 0xFF];
             }
         }
 
-        return tables;
+        return table;
     }
 }

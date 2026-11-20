@@ -289,7 +289,7 @@ public sealed class FastParseResultTests
         Assert.True(checksum > 0);
         Assert.Equal(0L, allocated);
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
         static ulong RunPngLoop(byte[] buf, int iterations)
         {
             ulong acc = 0;
