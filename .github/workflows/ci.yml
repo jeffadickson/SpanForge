@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (.NET 11 / C# 15)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 11 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore SpanForge.slnx
+
+      - name: Build solution (Release, TreatWarningsAsErrors)
+        run: dotnet build SpanForge.slnx -c Release --no-restore
+
+      - name: Build benchmarks
+        run: dotnet build benchmarks/SpanForge.Benchmarks/SpanForge.Benchmarks.csproj -c Release
+
+      - name: Run xUnit + CsCheck + Hedgehog + Zero-Alloc tests
+        run: dotnet test tests/SpanForge.Tests/SpanForge.Tests.csproj -c Release --no-build --verbosity normal
+
+      - name: Smoke-test Demo sample
+        run: dotnet run --project samples/SpanForge.Demo/SpanForge.Demo.csproj -c Release --no-build
+
+  mutation-testing:
+    name: Stryker.NET Mutation Tests (${{ matrix.target }})
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: core
+            config: stryker-config.json
+          - target: protocols
+            config: stryker-protocols-config.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 11 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '11.0.x'
+
+      - name: Restore local dotnet tools (dotnet-stryker)
+        run: dotnet tool restore
+
+      - name: Run Stryker.NET (${{ matrix.target }})
+        working-directory: tests/SpanForge.Tests
+        env:
+          DOTNET_ROLL_FORWARD: Major
+        run: dotnet tool run dotnet-stryker -f ../../${{ matrix.config }}
+
+      - name: Publish mutation summary
+        if: always()
+        shell: bash
+        run: |
+          REPORT=$(ls -t tests/SpanForge.Tests/StrykerOutput/*/reports/mutation-report.md 2>/dev/null | head -n 1 || true)
+          if [ -n "$REPORT" ]; then
+            echo "## Stryker.NET Mutation Report (${{ matrix.target }})" >> "$GITHUB_STEP_SUMMARY"
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Stryker reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stryker-report-${{ matrix.target }}
+          path: tests/SpanForge.Tests/StrykerOutput/*/reports/*
+          if-no-files-found: warn

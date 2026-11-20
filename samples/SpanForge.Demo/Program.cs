@@ -13,9 +13,9 @@ Console.WriteLine("  Combining Rust (nom + winnow + binrw + zerocopy) with .NET 
 Console.WriteLine("=================================================================");
 Console.WriteLine();
 
-// 1. PNG Protocol Showcase (native C# 15 `union PngChunk` + CRC-32)
+// 1. PNG Protocol Showcase (zero-boxing C# 15 `[Union] PngChunk` + slicing-by-8 CRC-32)
 {
-    Console.WriteLine("[1] PNG Document Parser (native C# 15 `public union PngChunk`)");
+    Console.WriteLine("[1] PNG Document Parser (zero-boxing C# 15 `[Union] PngChunk`)");
     byte[] png =
     [
         .. PngParser.Signature,
