@@ -1,0 +1,18 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+*.cache
+.vs/
+.idea/
+
+# Stryker.NET output
+StrykerOutput/
+
+# Rust benchmark build artifacts
+benchmarks/rust-bench/target/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+{
+  "stryker-config": {
+    "project": "SpanNom.csproj",
+    "reporters": [
+      "progress",
+      "cleartext",
+      "markdown"
+    ],
+    "thresholds": {
+      "high": 80,
+      "low": 60,
+      "break": 0
+    },
+    "concurrency": 2,
+    "verbosity": "info",
+    "mutate": [
+      "Core/Needed.cs",
+      "Core/Option.cs",
+      "Core/ParseResult.cs",
+      "Core/Railroad.cs",
+      "Core/BitCursor.cs",
+      "Streaming/StreamingDecoder.cs"
+    ]
+  }
+}

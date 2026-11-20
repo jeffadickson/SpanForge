@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>SpanNom.Benchmarks</AssemblyName>
+    <RootNamespace>SpanNom.Benchmarks</RootNamespace>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/SpanNom/SpanNom.csproj" />
+    <ProjectReference Include="../../src/SpanNom.Protocols/SpanNom.Protocols.csproj" />
+  </ItemGroup>
+</Project>
