@@ -1,6 +1,6 @@
 {
   "stryker-config": {
-    "project": "SpanNom.csproj",
+    "project": "SpanForge.csproj",
     "reporters": [
       "progress",
       "cleartext",

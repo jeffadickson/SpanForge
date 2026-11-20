@@ -1,7 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <AssemblyName>SpanNom</AssemblyName>
-    <RootNamespace>SpanNom</RootNamespace>
-    <Description>A zero-allocation, C# 15 union-powered Span and binary parser combinator library inspired by Rust's nom, winnow, binrw, and zerocopy.</Description>
-  </PropertyGroup>
-</Project>

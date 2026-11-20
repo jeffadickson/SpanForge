@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SpanForge/SpanForge.csproj" />
+    <Project Path="src/SpanForge.Protocols/SpanForge.Protocols.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SpanForge.Tests/SpanForge.Tests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/SpanForge.Demo/SpanForge.Demo.csproj" />
+  </Folder>
+</Solution>

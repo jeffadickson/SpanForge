@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>SpanForge.Benchmarks</AssemblyName>
+    <RootNamespace>SpanForge.Benchmarks</RootNamespace>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/SpanForge/SpanForge.csproj" />
+    <ProjectReference Include="../../src/SpanForge.Protocols/SpanForge.Protocols.csproj" />
+  </ItemGroup>
+</Project>

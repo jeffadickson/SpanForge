@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SpanForge.Protocols</AssemblyName>
+    <RootNamespace>SpanForge.Protocols</RootNamespace>
+    <Description>Real-world binary protocol parsers (PNG, WebSocket, Redis RESP, DNS) built on SpanForge and C# 15 unions.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SpanForge/SpanForge.csproj" />
+  </ItemGroup>
+</Project>

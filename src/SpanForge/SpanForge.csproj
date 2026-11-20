@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SpanForge</AssemblyName>
+    <RootNamespace>SpanForge</RootNamespace>
+    <Description>A zero-allocation, C# 15 union-powered Span and binary parser combinator library inspired by Rust's nom, winnow, binrw, and zerocopy.</Description>
+  </PropertyGroup>
+</Project>
