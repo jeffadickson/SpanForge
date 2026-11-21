@@ -18,7 +18,10 @@
       "Png/PngParser.cs",
       "WebSocket/WebSocketFrameParser.cs",
       "Resp/RespParser.cs",
-      "Dns/DnsParser.cs"
+      "Dns/DnsParser.cs",
+      "Protobuf/ProtobufParser.cs",
+      "Http2/Http2FrameParser.cs",
+      "Mqtt/MqttV5Parser.cs"
     ]
   }
 }

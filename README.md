@@ -14,9 +14,11 @@ A **zero-allocation, C# 15 union-powered `Span<byte>` and binary parser combinat
 | `nom::bytes` + `nom::complete` / `streaming` | `InputMode.Complete` & `InputMode.Streaming` + `SearchValues<byte>` SIMD | Early mismatch detection in `Tag`, exact `Needed` hints, Complete-mode shortage constant folding |
 | `nom::bits` / `deku` | `ref struct BitCursor` + `cursor.ParseBits(...)` | MSB-first arbitrary cross-byte bitfields + signed two's complement |
 | `binrw` scoped endianness & alignment | `Parse.ScopedEndian(...)` + `cursor.Align(n)` | Restores endianness automatically on checkpoint rollback |
+| `binrw` declarative binary structs | `SpanForge.Generators` (`[BinaryStruct]`, `[Magic]`, `[Endian]`, `[Bits]`, `[VarInt]`, `[LengthPrefixed]`, `[FixedBytes]`, `[Align]`, `[Pad]`, `[AssertValue]`) | Incremental Roslyn source generator emitting 0-alloc `Parse`, `TryParse`, `IParser<T>`, and `ITryParser<T>` |
+| `tokio-util::codec` async framing | `SpanForge.Pipelines` (`PipeParser`, `PipeSequenceAdapter`, `[Union] PipeParseOutcome<T>`) | Zero-copy single-segment `PipeReader` fast path + pooled multi-segment framing with backpressure & DoS caps |
 | `zerocopy::FromBytes` | `cursor.ReadBlittable<T>()` + `ByteSlice` + C# 15 extension indexer `span[slice]` | 8-byte non-`ref struct` slice handles live inside unions & ASTs with zero payload copies |
 | Rust `trait Parser` & `winnow::dispatch!` | `IParser<T>` / `StructParsers`, `IParser<T, TError>` / `FastParsers`, & `ITryParser<T>` / `TryParsers` (`Preceded`, `Delimited`, `Alt`, `Dispatch`, `FoldDispatch`) | JIT-inlined value-type combinators with 0 delegate dispatch and 0 allocations |
-| Rust `enum` protocol ASTs | Zero-boxing `[Union]` (`PngChunk`, 16-byte `WebSocketFrame`), `public union` (`DnsRecordData`), and `public closed record class` (`RespValue`) | Compiler-enforced exhaustiveness across zero-boxing hot-path unions, flat unions, and recursive ASTs |
+| Rust `enum` protocol ASTs | Zero-boxing `[Union]` (`PngChunk`, `WebSocketFrame`, `ProtobufField`, `Http2Frame`, `MqttPacket`), `public union` (`DnsRecordData`), and `public closed record class` (`RespValue`) | Compiler-enforced exhaustiveness across zero-boxing hot-path unions, flat unions, and recursive ASTs |
 | Pre-sized collections & nested loops | C# 15 `[with(capacity: count)]` + labeled `break` / `continue` | Used in `Parse.Count`, `Many0`, `FoldMany0`, `DnsParser`, `PngParser` |
 
 ## Head-to-Head Benchmark vs Rust (`winnow 1.0.5` & `nom 8.0.0`)
@@ -35,14 +37,20 @@ Measured on Intel Xeon Platinum 8481C (`net11.0`, C# 15, Release + TieredPGO, `A
 
 - **`src/SpanForge/`** — Zero-dependency core library (`net11.0`, C# 15, `TreatWarningsAsErrors=true`, `AllowUnsafeBlocks=false`):
   - `Core/`: `ParseResult<T>`, `ParseResult<T, TError>` (`NoError`, `KindError`, `CompactError`), `FastStatus`, `FastResult<T>`, `ITryParser<T>` / `TryParsers`, `Railroad`, `Needed`, `Option<T>`, `ByteSlice` (+ C# 15 extension indexer), `ByteCursor` (+ `ByteCursor.Fast`, `ByteCursor.Try`), `BitCursor`, `ParseError` (with hex+ASCII caret diagnostics).
+  - `Attributes/`: `binrw`-style declarative attributes (`[BinaryStruct]`, `[Magic]`, `[Endian]`, `[Bits]`, `[VarInt]`, `[LengthPrefixed]`, `[FixedBytes]`, `[Align]`, `[Pad]`, `[AssertValue]`).
   - `Combinators/`: `Parse`, `IParser<T>`, `IParser<T, TError>`, `StructParsers`, and `FastParsers`.
   - `Streaming/`: `StreamingDecoder<T>` incremental chunked stream driver.
-- **`src/SpanForge.Protocols/`** — Real-world binary protocol parsers:
-  - `PngParser` — PNG magic signature, flat slicing-by-8+4 IEEE CRC-32, zero-boxing `[Union] PngChunk` (0 B/op), streaming chunks.
-  - `WebSocketFrameParser` — RFC 6455 `ParseFrame` & `TryParseFrame`, 16-byte zero-boxing `[Union] WebSocketFrame` (0 B/op), 64-bit/32-bit word-at-a-time `UnmaskInto`.
+- **`src/SpanForge.Generators/`** — `netstandard2.0` Roslyn incremental source generator (`BinaryStructGenerator`) emitting zero-alloc `Parse`, `TryParse`, `Parser`, and `TryParser` implementations with compile-time diagnostics (`SFG001`–`SFG003`).
+- **`src/SpanForge.Pipelines/`** — Zero-dependency .NET 11 `System.IO.Pipelines` integration (`PipeParser`, `PipeSequenceAdapter`, `[Union] PipeParseOutcome<T>`) with single-segment zero-copy fast path, pooled multi-segment framing, `SpanFrameProjector`, backpressure, and DoS buffer caps.
+- **`src/SpanForge.Protocols/`** — **7 real-world binary protocol parsers** (all zero-copy, streaming-capable):
+  - `PngParser` — PNG magic signature, flat slicing-by-8+4 IEEE CRC-32, zero-boxing `[Union] PngChunk` (0 B/op).
+  - `WebSocketFrameParser` — RFC 6455 `ParseFrame` & `TryParseFrame`, 16-byte `[Union] WebSocketFrame` (0 B/op), 64-bit/32-bit `UnmaskInto`.
   - `RespParser` — Redis RESP2 with `public closed record class RespValue` and `Alt`+`Cut` diagnostics.
   - `DnsParser` — RFC 1035 DNS packet with bitfield flags, label compression pointers + cycle guard, `public union DnsRecordData`.
-- **`tests/SpanForge.Tests/`** — **77 xUnit tests** covering unions, primitives, varints, bitfields, combinators, byte-by-byte streaming, all 4 protocols, strict `0 bytes` allocation assertions, **CsCheck 5.0.1** property/fuzz tests, **Hedgehog 2.0.4** integrated shrinking, and **Stryker.NET 5.1.0** mutation testing (**88.01%** core / **84.38%** protocols).
+  - `ProtobufParser` — Protocol Buffers wire format (`ParseField` / `TryParseField`), 16-byte `[Union] ProtobufField` (0 B/op), ZigZag 32/64, packed repeated varints.
+  - `Http2FrameParser` — RFC 9113 client preface & all 11 `[Union] Http2Frame` variants (0 B/op), padding/stream-ID/frame-size guards, indexed `SETTINGS` reader.
+  - `MqttV5Parser` — OASIS MQTT v5.0 fixed header, 1–4 byte Variable Byte Integer, v5 properties, and 9 `[Union] MqttPacket` variants (0 B/op).
+- **`tests/SpanForge.Tests/`** — **89 xUnit tests** covering unions, primitives, varints, bitfields, combinators, byte-by-byte streaming, Roslyn source generation, `System.IO.Pipelines` async framing, all 7 protocols, strict `0 bytes` allocation assertions, **CsCheck 5.0.1** property/fuzz tests, **Hedgehog 2.0.4** integrated shrinking, and **Stryker.NET 5.1.0** mutation testing.
 - **`benchmarks/`** — Head-to-head benchmarks comparing `SpanForge.Benchmarks` (C# 15 / .NET 11) against `rust-bench` (`winnow 1.0.5` & `nom 8.0.0`).
 - **`samples/SpanForge.Demo/`** — End-to-end showcase and WebSocket throughput/allocation micro-benchmark.
 

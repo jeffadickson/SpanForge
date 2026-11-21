@@ -1,6 +1,8 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/SpanForge/SpanForge.csproj" />
+    <Project Path="src/SpanForge.Generators/SpanForge.Generators.csproj" />
+    <Project Path="src/SpanForge.Pipelines/SpanForge.Pipelines.csproj" />
     <Project Path="src/SpanForge.Protocols/SpanForge.Protocols.csproj" />
   </Folder>
   <Folder Name="/tests/">

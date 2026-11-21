@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SpanForge.Pipelines</AssemblyName>
+    <RootNamespace>SpanForge.Pipelines</RootNamespace>
+    <Description>Zero-copy System.IO.Pipelines (PipeReader / ReadOnlySequence) framing integration for SpanForge.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SpanForge/SpanForge.csproj" />
+  </ItemGroup>
+</Project>
