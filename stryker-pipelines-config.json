@@ -1,0 +1,22 @@
+{
+  "stryker-config": {
+    "project": "SpanForge.Pipelines.csproj",
+    "reporters": [
+      "progress",
+      "cleartext",
+      "markdown",
+      "json"
+    ],
+    "thresholds": {
+      "high": 85,
+      "low": 80,
+      "break": 80
+    },
+    "concurrency": 2,
+    "verbosity": "info",
+    "mutate": [
+      "PipeParseOutcome.cs",
+      "PipeParser.cs"
+    ]
+  }
+}

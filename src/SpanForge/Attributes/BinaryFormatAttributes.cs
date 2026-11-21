@@ -16,10 +16,26 @@ public enum VarIntEncoding : byte
 }
 
 /// <summary>
+/// Wire width of the leading discriminant tag for <see cref="BinaryUnionAttribute"/> types.
+/// </summary>
+public enum TagWidth : byte
+{
+    /// <summary>1-byte unsigned tag (<see cref="byte"/>).</summary>
+    U8 = 0,
+
+    /// <summary>2-byte unsigned tag (<see cref="ushort"/>) using the union's default endianness.</summary>
+    U16 = 1,
+
+    /// <summary>4-byte unsigned tag (<see cref="uint"/>) using the union's default endianness.</summary>
+    U32 = 2,
+}
+
+/// <summary>
 /// Marks a <c>partial struct</c>, <c>partial record struct</c>, or <c>partial class</c> for
-/// compile-time zero-allocation binary parser generation (<c>Parse(ref ByteCursor)</c>,
-/// <c>TryParse(ref ByteCursor, out T)</c>, <c>Parser : IParser&lt;T&gt;</c>, and
-/// <c>TryParser : ITryParser&lt;T&gt;</c>), inspired by Rust's <c>binrw</c>.
+/// compile-time zero-allocation binary parser and writer generation (<c>Parse(ref ByteCursor)</c>,
+/// <c>TryParse(ref ByteCursor, out T)</c>, <c>TryWrite(ref ByteWriter, ReadOnlySpan&lt;byte&gt;)</c>,
+/// <c>TryWriteTo(Span&lt;byte&gt;, ReadOnlySpan&lt;byte&gt;)</c>, <c>WriteTo(IBufferWriter&lt;byte&gt;, ...)</c>,
+/// <c>Parser : IParser&lt;T&gt;</c>, and <c>TryParser : ITryParser&lt;T&gt;</c>), inspired by Rust's <c>binrw</c>.
 /// </summary>
 [AttributeUsage(AttributeTargets.Struct | AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
 public sealed class BinaryStructAttribute : Attribute
@@ -161,3 +177,43 @@ public sealed class AssertValueAttribute : Attribute
 
     public ulong Expected { get; }
 }
+
+/// <summary>
+/// Marks a <c>partial struct</c> (typically <c>public readonly partial struct</c>) for compile-time
+/// C# 15 custom <c>[Union]</c> discriminated-union generation with zero-allocation tag-dispatched
+/// <c>Parse</c>, <c>TryParse</c>, <c>TryWrite</c>, <c>TryWriteTo</c>, and <c>WriteTo</c>.
+/// Pair with one or more <see cref="UnionCaseAttribute"/> attributes.
+/// </summary>
+[AttributeUsage(AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
+public sealed class BinaryUnionAttribute : Attribute
+{
+    public BinaryUnionAttribute(
+        Endianness defaultEndianness = Endianness.Big,
+        TagWidth tagWidth = TagWidth.U8)
+    {
+        DefaultEndianness = defaultEndianness;
+        TagWidth = tagWidth;
+    }
+
+    public Endianness DefaultEndianness { get; }
+    public TagWidth TagWidth { get; }
+}
+
+/// <summary>
+/// Declares a tagged variant case on a <see cref="BinaryUnionAttribute"/> type.
+/// Each case must specify a distinct discriminant <see cref="Tag"/> and a distinct <see cref="PayloadType"/>
+/// (either a primitive numeric/bool type, a <see cref="BinaryStructAttribute"/> type, or another <see cref="BinaryUnionAttribute"/> type).
+/// </summary>
+[AttributeUsage(AttributeTargets.Struct, Inherited = false, AllowMultiple = true)]
+public sealed class UnionCaseAttribute : Attribute
+{
+    public UnionCaseAttribute(uint tag, Type payloadType)
+    {
+        Tag = tag;
+        PayloadType = payloadType;
+    }
+
+    public uint Tag { get; }
+    public Type PayloadType { get; }
+}
+

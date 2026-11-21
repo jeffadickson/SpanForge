@@ -5,7 +5,7 @@ namespace SpanForge.Streaming;
 /// <see cref="SpanParser{T}"/> parsers returning C# 15 <see cref="ParseResult{T}"/> unions.
 /// <para>
 /// Feed arbitrary chunks (even 1 byte at a time) via <see cref="Append"/> and pull decoded frames
-/// via <see cref="TryDecodeNext"/>. When the parser returns <see cref="Incomplete"/>, unconsumed bytes
+/// via <see cref="TryDecodeNext(out ReadOnlySpan{byte}, bool)"/>. When the parser returns <see cref="Incomplete"/>, unconsumed bytes
 /// remain buffered automatically until more data arrives.
 /// </para>
 /// </summary>
@@ -48,7 +48,7 @@ public sealed class StreamingDecoder<T>
     /// when <paramref name="isFinalChunk"/> is <see langword="true"/>).
     /// <para>
     /// Notice: If <typeparamref name="T"/> contains <see cref="ByteSlice"/> offsets, inspect them against
-    /// <paramref name="consumedFrame"/> before calling <see cref="TryDecodeNext"/> again.
+    /// <paramref name="consumedFrame"/> before calling <see cref="TryDecodeNext(out ReadOnlySpan{byte}, bool)"/> again.
     /// </para>
     /// </summary>
     public ParseResult<T> TryDecodeNext(out ReadOnlySpan<byte> consumedFrame, bool isFinalChunk = false)

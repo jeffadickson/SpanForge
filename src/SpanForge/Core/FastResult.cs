@@ -5,7 +5,7 @@ namespace SpanForge;
 /// <summary>
 /// 4-byte register-sized modal parse status (zero GC references, zero nested structs)
 /// encoding <c>Parsed</c>, <c>Incomplete(Needed)</c>, <c>Backtrack</c>, or <c>Failure</c>.
-/// Used by <see cref="IFastParser{T}"/> to eliminate intermediate struct copies in <c>Alt</c>/<c>Delimited</c> pipelines.
+/// Used by <see cref="ITryParser{T}"/> to eliminate intermediate struct copies in <c>Alt</c>/<c>Delimited</c> pipelines.
 /// </summary>
 public readonly struct FastStatus : IEquatable<FastStatus>
 {

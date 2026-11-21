@@ -1,10 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <PackageId>SpanForge.Protocols</PackageId>
     <AssemblyName>SpanForge.Protocols</AssemblyName>
     <RootNamespace>SpanForge.Protocols</RootNamespace>
-    <Description>Real-world binary protocol parsers (PNG, WebSocket, Redis RESP, DNS, Protobuf, HTTP/2, MQTT v5) built on SpanForge and C# 15 unions.</Description>
+    <Description>Real-world zero-copy binary protocol parsers (PNG, WebSocket, Redis RESP, DNS, Protobuf, HTTP/2, MQTT v5) built on SpanForge and C# 15 unions.</Description>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../SpanForge/SpanForge.csproj" />
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

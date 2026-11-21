@@ -21,7 +21,7 @@ public sealed record class RespNull : RespValue
 public sealed record class RespArray(IReadOnlyList<RespValue> Items) : RespValue;
 
 /// <summary>
-/// Redis RESP2 protocol parser built with <see cref="Parse.Alt"/>, <see cref="Parse.Cut"/>,
+/// Redis RESP2 protocol parser built with <c>Parse.Alt</c>, <see cref="Parse.Cut{T}(ref ByteCursor, SpanParser{T}, string?)"/>,
 /// zero-copy <see cref="ByteSlice"/> strings, and C# 15 collection expression capacity arguments.
 /// </summary>
 public static class RespParser

@@ -288,6 +288,274 @@ public sealed class PipelinesTests
         await tryPipe.Reader.CompleteAsync();
     }
 
+    private readonly struct AlwaysIncompleteTryParser : ITryParser<uint>
+    {
+        public FastStatus TryParse(ref ByteCursor cursor, out uint value)
+        {
+            value = 0;
+            return FastStatus.IncompleteBytes(4);
+        }
+    }
+
+    private readonly struct FailureOrBacktrackTryParser(bool fail) : ITryParser<uint>
+    {
+        public FastStatus TryParse(ref ByteCursor cursor, out uint value)
+        {
+            value = 0;
+            return fail ? FastStatus.Failure : FastStatus.Backtrack;
+        }
+    }
+
+    [Fact]
+    public async Task PipeParser_MutationKiller_AllBranchesAndGuards()
+    {
+        // 1. PipeParseOutcome TryGetValue mismatch branches
+        PipeParseOutcome<int> parsed = new PipeParsed<int>(99);
+        Assert.False(parsed.TryGetValue(out PipeEndOfStream _));
+        Assert.False(parsed.TryGetValue(out PipeIncompleteAtEof _));
+        Assert.False(parsed.TryGetValue(out PipeFailed _));
+        Assert.False(parsed.IsEndOfStream);
+        Assert.False(parsed.IsIncompleteAtEof);
+        Assert.False(parsed.IsFailed);
+
+        PipeParseOutcome<int> eof = new PipeEndOfStream();
+        Assert.False(eof.TryGetValue(out PipeParsed<int> _));
+        Assert.True(eof.TryGetValue(out PipeEndOfStream _));
+
+        PipeParseOutcome<int> inc = new PipeIncompleteAtEof(Needed.Bytes(5));
+        Assert.True(inc.TryGetValue(out PipeIncompleteAtEof incVal) && incVal.Needed.TryGetValue(out ExactBytes ex5) && ex5.Count == 5);
+        Assert.False(inc.TryGetValue(out PipeFailed _));
+
+        PipeParseOutcome<int> fail = new PipeFailed(new ParseError(4, ErrorKind.Tag, "bad"));
+        Assert.True(fail.TryGetValue(out PipeFailed fVal) && fVal.Error.Offset == 4 && fVal.Error.Kind == ErrorKind.Tag);
+
+        // 2. PipeSequenceAdapter argument guards & non-parsed paths across all 3 overloads (single & multi segment)
+        byte[] fourBytes = [0x00, 0x05, 0xAA, 0xBB]; // U16 len=5, only 2 bytes follow -> Incomplete in Streaming
+        var single = new ReadOnlySequence<byte>(fourBytes);
+        var multi = BuildMultiSegment(fourBytes, chunkSize: 2);
+
+        Xunit.Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PipeSequenceAdapter.TryParseSequence(in single, false, static (ref ByteCursor c) => c.ReadU32BE(), out _, out _, maxBufferSize: 0));
+        Xunit.Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PipeSequenceAdapter.TryParseSequence(in single, false, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v, out _, out _, maxBufferSize: 0));
+        Xunit.Assert.Throws<ArgumentOutOfRangeException>(() =>
+            PipeSequenceAdapter.TryParseSequence<TryParsers.U32BEParser, uint>(in single, false, TryParsers.U32BE, out _, out _, out _, maxBufferSize: 0));
+
+        // Overload 1 (SpanParser<T>): single parsed, single non-parsed, multi parsed, multi non-parsed, multi completed-short -> Backtrack, multi truncated by maxBufferSize -> Incomplete
+        Assert.True(PipeSequenceAdapter.TryParseSequence(in single, true, static (ref ByteCursor c) => c.ReadU16BE(), out var c1, out var r1));
+        Assert.Equal((ushort)5, r1.Unwrap());
+        Assert.Equal(2L, single.Slice(0, c1).Length);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in single, false, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), out var c1Fail, out var r1Fail));
+        Assert.Equal(single.Start, c1Fail);
+        Assert.True(r1Fail.IsIncomplete);
+
+        Assert.True(PipeSequenceAdapter.TryParseSequence(in multi, true, static (ref ByteCursor c) => c.ReadU16BE(), out var cm1, out var rm1));
+        Assert.Equal((ushort)5, rm1.Unwrap());
+        Assert.Equal(2L, multi.Slice(0, cm1).Length);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, false, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), out var cmFail, out var rmFail));
+        Assert.Equal(multi.Start, cmFail);
+        Assert.True(rmFail.IsIncomplete);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, isCompleted: true, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), out var cmCompFail, out var rmCompFail));
+        Assert.Equal(multi.Start, cmCompFail);
+        Assert.True(rmCompFail.IsBacktrack);
+
+        // Multi-segment truncated by maxBufferSize=2 with isCompleted=true stays in Streaming mode -> Incomplete!
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, isCompleted: true, static (ref ByteCursor c) => c.ReadU32BE(), out var cmTrunc, out var rmTrunc, maxBufferSize: 2));
+        Assert.Equal(multi.Start, cmTrunc);
+        Assert.True(rmTrunc.IsIncomplete);
+
+        // Overload 2 (Projector): single non-parsed, multi non-parsed, multi completed-short -> Backtrack, multi truncated -> Incomplete
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in single, false, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), static (s, _) => s.Length, out var cpFail, out var rpFail));
+        Assert.Equal(single.Start, cpFail);
+        Assert.True(rpFail.IsIncomplete);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, false, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), static (s, _) => s.Length, out var cpmFail, out var rpmFail));
+        Assert.Equal(multi.Start, cpmFail);
+        Assert.True(rpmFail.IsIncomplete);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, isCompleted: true, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), static (s, _) => s.Length, out _, out var rpmComp));
+        Assert.True(rpmComp.IsBacktrack);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, isCompleted: true, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v, out _, out var rpmTrunc, maxBufferSize: 2));
+        Assert.True(rpmTrunc.IsIncomplete);
+
+        // Overload 3 (ITryParser<T>): single parsed, single non-parsed, single completed-short, multi non-parsed, multi completed-short, multi truncated
+        Assert.True(PipeSequenceAdapter.TryParseSequence(in single, true, TryParsers.U16BE, out var ct1, out var st1, out ushort v1));
+        Assert.True(st1.IsParsed && v1 == 5);
+        Assert.Equal(2L, single.Slice(0, ct1).Length);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in single, false, TryParsers.F64BE, out var ctFail, out var stFail, out double _));
+        Assert.Equal(single.Start, ctFail);
+        Assert.True(stFail.IsIncomplete);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in single, true, TryParsers.F64BE, out _, out var stCompFail, out double _));
+        Assert.True(stCompFail.IsBacktrack);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, false, TryParsers.F64BE, out var ctmFail, out var stmFail, out double _));
+        Assert.Equal(multi.Start, ctmFail);
+        Assert.True(stmFail.IsIncomplete);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, true, TryParsers.F64BE, out _, out var stmCompFail, out double _));
+        Assert.True(stmCompFail.IsBacktrack);
+
+        Assert.False(PipeSequenceAdapter.TryParseSequence(in multi, true, TryParsers.U32BE, out _, out var stmTrunc, out uint _, maxBufferSize: 2));
+        Assert.True(stmTrunc.IsIncomplete);
+
+        // 3. PipeParser argument validation
+        var guardPipe = new Pipe();
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<uint>(null!, static (ref ByteCursor c) => c.ReadU32BE()).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<uint>(guardPipe.Reader, (SpanParser<uint>)null!).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => PipeParser.ReadOneAsync(guardPipe.Reader, static (ref ByteCursor c) => c.ReadU32BE(), maxBufferSize: 0).AsTask());
+
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<uint, uint>(null!, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<uint, uint>(guardPipe.Reader, null!, static (v, _) => v).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<uint, uint>(guardPipe.Reader, static (ref ByteCursor c) => c.ReadU32BE(), null!).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => PipeParser.ReadOneAsync(guardPipe.Reader, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v, maxBufferSize: 0).AsTask());
+
+        await Xunit.Assert.ThrowsAsync<ArgumentNullException>(() => PipeParser.ReadOneAsync<TryParsers.U32BEParser, uint>(null!, TryParsers.U32BE).AsTask());
+        await Xunit.Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => PipeParser.ReadOneAsync<TryParsers.U32BEParser, uint>(guardPipe.Reader, TryParsers.U32BE, maxBufferSize: 0).AsTask());
+        await guardPipe.Writer.CompleteAsync();
+        await guardPipe.Reader.CompleteAsync();
+
+        // 4. ReadOneAsync<T>: Failure, Backtrack, IncompleteAtEof, and exact maxBufferSize boundary (==)
+        static ParseResult<uint> AlwaysFailure(ref ByteCursor _) => Failure.At(0, ErrorKind.Protocol, "boom");
+        static ParseResult<uint> AlwaysIncomplete(ref ByteCursor _) => Incomplete.AtLeast(7);
+
+        // Verify AdvanceTo was properly called before returning by issuing TryRead on the reader afterwards!
+        async Task<PipeParseOutcome<T>> RunSingleChunk<T>(byte[] data, bool complete, Func<PipeReader, ValueTask<PipeParseOutcome<T>>> fn)
+        {
+            var p = new Pipe();
+            if (data.Length > 0)
+            {
+                data.CopyTo(p.Writer.GetSpan(data.Length));
+                p.Writer.Advance(data.Length);
+                await p.Writer.FlushAsync();
+            }
+            if (complete) await p.Writer.CompleteAsync();
+            var outcome = await fn(p.Reader);
+            // If ReadOneAsync omitted reader.AdvanceTo(...), TryRead throws InvalidOperationException("Reading is already in progress")!
+            if (p.Reader.TryRead(out var after))
+            {
+                p.Reader.AdvanceTo(after.Buffer.Start);
+            }
+            if (!complete) await p.Writer.CompleteAsync();
+            await p.Reader.CompleteAsync();
+            return outcome;
+        }
+
+        // Empty-at-eof, Failure, Backtrack, IncompleteAtEof, and maxBufferSize on ReadOneAsync<T>
+        var rEmpty1 = await RunSingleChunk([], true, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE()));
+        Assert.True(rEmpty1.IsEndOfStream);
+
+        var rf1 = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, AlwaysFailure));
+        Assert.True(rf1.TryGetValue(out PipeFailed pf1) && pf1.Error.Kind == ErrorKind.Protocol && pf1.Error.Context == "boom");
+
+        var rbt1 = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE()));
+        Assert.True(rbt1.TryGetValue(out PipeFailed pbt1) && pbt1.Error.Kind == ErrorKind.Eof);
+
+        var ri1 = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, AlwaysIncomplete));
+        Assert.True(ri1.TryGetValue(out PipeIncompleteAtEof pi1) && pi1.Needed.TryGetValue(out ExactBytes ex7) && ex7.Count == 7);
+
+        // Exact maxBufferSize boundary (buffer.Length == maxBufferSize)
+        var rMax1 = await RunSingleChunk([0x00, 0x0A, 0x01, 0x02], false, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), maxBufferSize: 4));
+        Assert.True(rMax1.TryGetValue(out PipeFailed pMax1) && pMax1.Error.Kind == ErrorKind.LengthValue && pMax1.Error.Context is not null && pMax1.Error.Context.Contains("maxBufferSize"));
+
+        // 5. ReadOneAsync<T, TOut> (projector): Failure, Backtrack, IncompleteAtEof, exact maxBufferSize, empty-at-eof
+        var rpEmpty = await RunSingleChunk([], true, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v));
+        Assert.True(rpEmpty.IsEndOfStream);
+
+        var rpFailOut = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, AlwaysFailure, static (v, _) => v));
+        Assert.True(rpFailOut.TryGetValue(out PipeFailed ppf) && ppf.Error.Kind == ErrorKind.Protocol);
+
+        var rpBt = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v));
+        Assert.True(rpBt.TryGetValue(out PipeFailed ppbt) && ppbt.Error.Kind == ErrorKind.Eof);
+
+        var rpInc = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync(r, AlwaysIncomplete, static (v, _) => v));
+        Assert.True(rpInc.TryGetValue(out PipeIncompleteAtEof ppi) && ppi.Needed.TryGetValue(out ExactBytes ex7p) && ex7p.Count == 7);
+
+        var rpMax = await RunSingleChunk([0x00, 0x0A, 0x01, 0x02], false, r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadLengthPrefixedBytes(LengthPrefix.U16), static (s, _) => s.Length, maxBufferSize: 4));
+        Assert.True(rpMax.TryGetValue(out PipeFailed ppMax) && ppMax.Error.Kind == ErrorKind.LengthValue && ppMax.Error.Context is not null && ppMax.Error.Context.Contains("maxBufferSize"));
+
+        // 6. ReadOneAsync<TParser, T>: empty-at-eof, trickled Incomplete -> Parsed, maxBufferSize, IncompleteAtEof, Failure, Backtrack
+        var rtEmpty = await RunSingleChunk([], true, r => PipeParser.ReadOneAsync<TryParsers.U32BEParser, uint>(r, TryParsers.U32BE));
+        Assert.True(rtEmpty.IsEndOfStream);
+
+        // Deterministic two-chunk trickle guaranteeing ReadOneAsync hits Incomplete -> AdvanceTo(Start, End) -> continue!
+        async Task<PipeParseOutcome<uint>> RunDeterministicTrickle(Func<PipeReader, ValueTask<PipeParseOutcome<uint>>> fn)
+        {
+            var p = new Pipe();
+            p.Writer.GetSpan(2)[0] = 0x11;
+            p.Writer.GetSpan(2)[1] = 0x22;
+            p.Writer.Advance(2);
+            await p.Writer.FlushAsync();
+
+            var readTask = fn(p.Reader).AsTask();
+            await Task.Delay(10); // let ReadOneAsync observe the first 2 bytes, return Incomplete, and suspend on ReadAsync
+            p.Writer.GetSpan(2)[0] = 0x33;
+            p.Writer.GetSpan(2)[1] = 0x44;
+            p.Writer.Advance(2);
+            await p.Writer.FlushAsync();
+            await p.Writer.CompleteAsync();
+
+            var res = await readTask;
+            await p.Reader.CompleteAsync();
+            return res;
+        }
+
+        var rTrickle1 = await RunDeterministicTrickle(r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE()));
+        Assert.True(rTrickle1.TryGetValue(out PipeParsed<uint> okT1) && okT1.Value == 0x11223344u);
+
+        var rTrickle2 = await RunDeterministicTrickle(r => PipeParser.ReadOneAsync(r, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v));
+        Assert.True(rTrickle2.TryGetValue(out PipeParsed<uint> okT2) && okT2.Value == 0x11223344u);
+
+        var rtTrickle = await RunDeterministicTrickle(r => PipeParser.ReadOneAsync<TryParsers.U32BEParser, uint>(r, TryParsers.U32BE));
+        Assert.True(rtTrickle.TryGetValue(out PipeParsed<uint> okU32) && okU32.Value == 0x11223344u);
+
+        var rtMax = await RunSingleChunk([1, 2, 3, 4], false, r => PipeParser.ReadOneAsync<AlwaysIncompleteTryParser, uint>(r, default, maxBufferSize: 4));
+        Assert.True(rtMax.TryGetValue(out PipeFailed ptm) && ptm.Error.Kind == ErrorKind.LengthValue && ptm.Error.Context is not null && ptm.Error.Context.Contains("maxBufferSize"));
+
+        var rtInc = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync<AlwaysIncompleteTryParser, uint>(r, default));
+        Assert.True(rtInc.TryGetValue(out PipeIncompleteAtEof pti) && pti.Needed.TryGetValue(out ExactBytes ex4) && ex4.Count == 4);
+
+        var rtFail = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync<FailureOrBacktrackTryParser, uint>(r, new FailureOrBacktrackTryParser(fail: true)));
+        Assert.True(rtFail.TryGetValue(out PipeFailed ptf) && ptf.Error.Kind == ErrorKind.Protocol);
+
+        var rtBt = await RunSingleChunk([1, 2], true, r => PipeParser.ReadOneAsync<FailureOrBacktrackTryParser, uint>(r, new FailureOrBacktrackTryParser(fail: false)));
+        Assert.True(rtBt.TryGetValue(out PipeFailed ptb) && ptb.Error.Kind == ErrorKind.Eof);
+
+        // 7. ReadAllAsync<T> and ReadAllAsync<T, TOut> yield terminal PipeFailed and stop cleanly!
+        var errPipe1 = new Pipe();
+        errPipe1.Writer.GetSpan(2)[0] = 0xAA;
+        errPipe1.Writer.Advance(2);
+        await errPipe1.Writer.FlushAsync();
+        await errPipe1.Writer.CompleteAsync();
+        int errCount1 = 0;
+        await foreach (var o in PipeParser.ReadAllAsync(errPipe1.Reader, static (ref ByteCursor c) => c.ReadU32BE()))
+        {
+            Assert.True(o.IsFailed);
+            errCount1++;
+        }
+        await errPipe1.Reader.CompleteAsync();
+        Assert.Equal(1, errCount1);
+
+        var errPipe2 = new Pipe();
+        errPipe2.Writer.GetSpan(2)[0] = 0xBB;
+        errPipe2.Writer.Advance(2);
+        await errPipe2.Writer.FlushAsync();
+        await errPipe2.Writer.CompleteAsync();
+        int errCount2 = 0;
+        await foreach (var o in PipeParser.ReadAllAsync(errPipe2.Reader, static (ref ByteCursor c) => c.ReadU32BE(), static (v, _) => v))
+        {
+            Assert.True(o.IsFailed);
+            errCount2++;
+        }
+        await errPipe2.Reader.CompleteAsync();
+        Assert.Equal(1, errCount2);
+    }
+
     private static byte[] BuildMaskedTextFrame(ReadOnlySpan<byte> payload, uint maskKey)
     {
         byte[] mask = [(byte)(maskKey >> 24), (byte)(maskKey >> 16), (byte)(maskKey >> 8), (byte)maskKey];

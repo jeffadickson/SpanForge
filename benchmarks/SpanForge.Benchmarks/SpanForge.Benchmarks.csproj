@@ -8,5 +8,8 @@
   <ItemGroup>
     <ProjectReference Include="../../src/SpanForge/SpanForge.csproj" />
     <ProjectReference Include="../../src/SpanForge.Protocols/SpanForge.Protocols.csproj" />
+    <ProjectReference Include="../../src/SpanForge.Generators/SpanForge.Generators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 </Project>

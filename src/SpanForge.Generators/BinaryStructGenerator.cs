@@ -14,6 +14,7 @@ namespace SpanForge.Generators;
 public sealed class BinaryStructGenerator : IIncrementalGenerator
 {
     private const string BinaryStructAttr = "SpanForge.BinaryStructAttribute";
+    private const string BinaryUnionAttr = "SpanForge.BinaryUnionAttribute";
     private const string MagicAttr = "SpanForge.MagicAttribute";
     private const string EndianAttr = "SpanForge.EndianAttribute";
     private const string VarIntAttr = "SpanForge.VarIntAttribute";
@@ -383,7 +384,9 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
                 return null;
             }
         }
-        else if (type.GetAttributes().Any(a => a.AttributeClass?.ToDisplayString() == BinaryStructAttr))
+        else if (type.GetAttributes().Any(a =>
+            a.AttributeClass?.ToDisplayString() == BinaryStructAttr ||
+            a.AttributeClass?.ToDisplayString() == BinaryUnionAttr))
         {
             kind = MemberKind.NestedBinaryStruct;
         }
@@ -484,6 +487,8 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         EmitParseMethod(sb, model, bodyIndent);
         sb.AppendLine();
         EmitTryParseMethod(sb, model, bodyIndent);
+        sb.AppendLine();
+        EmitWriteMethods(sb, model, bodyIndent);
         sb.AppendLine();
         EmitParserStructs(sb, model, bodyIndent);
 
@@ -841,6 +846,209 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         }
 
         sb.Append(ind).AppendLine("}");
+    }
+
+    private static void EmitWriteMethods(StringBuilder sb, TypeModel model, string ind)
+    {
+        string inner = ind + "    ";
+        string defaultEndianEnum = model.DefaultEndianness == 0 ? "Big" : "Little";
+
+        sb.Append(ind).AppendLine("[MethodImpl(MethodImplOptions.AggressiveInlining)]");
+        sb.Append(ind).AppendLine("public bool TryWrite(ref global::SpanForge.ByteWriter writer, global::System.ReadOnlySpan<byte> sourceBuffer = default)");
+        sb.Append(ind).AppendLine("{");
+        sb.Append(inner).AppendLine("var __cp = writer.Save();");
+
+        if (model.TypeMagic is { Length: > 0 } tm)
+        {
+            EmitMagicWrite(sb, inner, tm);
+        }
+
+        int i = 0;
+        while (i < model.Members.Length)
+        {
+            MemberModel m = model.Members[i];
+
+            if (IsBitMember(m.Kind))
+            {
+                if (m.Pad > 0) EmitPadWrite(sb, inner, m.Pad);
+                if (m.Align > 0) EmitAlignWrite(sb, inner, m.Align);
+                if (m.Magic is { Length: > 0 } mm) EmitMagicWrite(sb, inner, mm);
+
+                int startBitIdx = i;
+                while (i < model.Members.Length && IsBitMember(model.Members[i].Kind))
+                {
+                    if (i > startBitIdx && (model.Members[i].Pad > 0 || model.Members[i].Align > 0 || model.Members[i].Magic is { Length: > 0 }))
+                    {
+                        break;
+                    }
+                    i++;
+                }
+
+                EmitBitBlockWrite(sb, inner, model.Members, startBitIdx, i);
+                continue;
+            }
+
+            if (m.Pad > 0) EmitPadWrite(sb, inner, m.Pad);
+            if (m.Align > 0) EmitAlignWrite(sb, inner, m.Align);
+            if (m.Magic is { Length: > 0 } mMagic) EmitMagicWrite(sb, inner, mMagic);
+
+            EmitMemberWrite(sb, inner, m, i);
+            i++;
+        }
+
+        sb.Append(inner).AppendLine("return true;");
+        sb.Append(ind).AppendLine("}");
+        sb.AppendLine();
+
+        sb.Append(ind).AppendLine("[MethodImpl(MethodImplOptions.AggressiveInlining)]");
+        sb.Append(ind).AppendLine("public int TryWriteTo(global::System.Span<byte> destination, global::System.ReadOnlySpan<byte> sourceBuffer = default)");
+        sb.Append(ind).AppendLine("{");
+        sb.Append(inner).Append("var __writer = new global::SpanForge.ByteWriter(destination, global::SpanForge.Endianness.").Append(defaultEndianEnum).AppendLine(");");
+        sb.Append(inner).AppendLine("return TryWrite(ref __writer, sourceBuffer) ? __writer.Position : -1;");
+        sb.Append(ind).AppendLine("}");
+        sb.AppendLine();
+
+        sb.Append(ind).AppendLine("public void WriteTo(global::System.Buffers.IBufferWriter<byte> output, global::System.ReadOnlySpan<byte> sourceBuffer = default, int initialHint = 256)");
+        sb.Append(ind).AppendLine("{");
+        sb.Append(inner).AppendLine("int __hint = initialHint > 0 ? initialHint : 64;");
+        sb.Append(inner).AppendLine("while (true)");
+        sb.Append(inner).AppendLine("{");
+        sb.Append(inner).AppendLine("    var __span = output.GetSpan(__hint);");
+        sb.Append(inner).Append("    var __writer = new global::SpanForge.ByteWriter(__span, global::SpanForge.Endianness.").Append(defaultEndianEnum).AppendLine(");");
+        sb.Append(inner).AppendLine("    if (TryWrite(ref __writer, sourceBuffer))");
+        sb.Append(inner).AppendLine("    {");
+        sb.Append(inner).AppendLine("        output.Advance(__writer.Position);");
+        sb.Append(inner).AppendLine("        return;");
+        sb.Append(inner).AppendLine("    }");
+        sb.Append(inner).AppendLine("    int __next = __span.Length >= __hint ? __span.Length : __hint;");
+        sb.Append(inner).AppendLine("    if (__next >= 67_108_864)");
+        sb.Append(inner).AppendLine("    {");
+        sb.Append(inner).AppendLine("        throw new global::System.InvalidOperationException(\"Failed to write binary value to IBufferWriter<byte>.\");");
+        sb.Append(inner).AppendLine("    }");
+        sb.Append(inner).AppendLine("    __hint = __next * 2;");
+        sb.Append(inner).AppendLine("}");
+        sb.Append(ind).AppendLine("}");
+    }
+
+    private static void EmitMagicWrite(StringBuilder sb, string ind, byte[] bytes)
+    {
+        if (bytes.Length == 1)
+        {
+            sb.Append(ind).Append("if (!writer.TryWriteU8(").Append(bytes[0]).AppendLine(")) { writer.Reset(__cp); return false; }");
+            return;
+        }
+
+        sb.Append(ind).Append("if (!writer.TryWriteBytes([");
+        for (int k = 0; k < bytes.Length; k++)
+        {
+            if (k > 0) sb.Append(", ");
+            sb.Append("0x").Append(bytes[k].ToString("X2"));
+        }
+        sb.AppendLine("])) { writer.Reset(__cp); return false; }");
+    }
+
+    private static void EmitPadWrite(StringBuilder sb, string ind, int padBytes)
+    {
+        sb.Append(ind).Append("if (!writer.TryWritePad(").Append(padBytes).AppendLine(")) { writer.Reset(__cp); return false; }");
+    }
+
+    private static void EmitAlignWrite(StringBuilder sb, string ind, int align)
+    {
+        sb.Append(ind).Append("if (!writer.TryAlign(").Append(align).AppendLine(")) { writer.Reset(__cp); return false; }");
+    }
+
+    private static void EmitBitBlockWrite(
+        StringBuilder sb,
+        string ind,
+        ImmutableArray<MemberModel> members,
+        int startIdx,
+        int endIdx)
+    {
+        string bwVar = $"__bw_{startIdx}";
+        sb.Append(ind).Append("var ").Append(bwVar).AppendLine(" = writer.CreateBitWriter();");
+        for (int k = startIdx; k < endIdx; k++)
+        {
+            MemberModel m = members[k];
+            string call = m.Kind switch
+            {
+                MemberKind.BitBool => $"{bwVar}.TryWriteBool(this.{m.Name})",
+                MemberKind.BitU8 => $"{bwVar}.TryWriteU8({m.Bits}, this.{m.Name})",
+                MemberKind.BitU16 => $"{bwVar}.TryWriteU16({m.Bits}, this.{m.Name})",
+                MemberKind.BitU32 => $"{bwVar}.TryWriteU32({m.Bits}, this.{m.Name})",
+                MemberKind.BitI32 => $"{bwVar}.TryWriteI32({m.Bits}, this.{m.Name})",
+                MemberKind.BitU64 => $"{bwVar}.TryWriteU64({m.Bits}, this.{m.Name})",
+                _ => throw new InvalidOperationException(),
+            };
+
+            sb.Append(ind).Append("if (!").Append(call).AppendLine(") { writer.Reset(__cp); return false; }");
+        }
+
+        sb.Append(ind).Append(bwVar).AppendLine(".AlignToByte();");
+        sb.Append(ind).Append("writer.Position = ").Append(bwVar).AppendLine(".CurrentByteOffset;");
+    }
+
+    private static void EmitMemberWrite(StringBuilder sb, string ind, MemberModel m, int idx)
+    {
+        bool isBe = m.Endianness == 0;
+        string suffix = isBe ? "BE" : "LE";
+
+        switch (m.Kind)
+        {
+            case MemberKind.BoolByte:
+                sb.Append(ind).Append("if (!writer.TryWriteBool(this.").Append(m.Name).AppendLine(")) { writer.Reset(__cp); return false; }");
+                return;
+
+            case MemberKind.LengthPrefixedSlice:
+            {
+                string lpName = m.LengthPrefix switch
+                {
+                    0 => "U8",
+                    1 => "U16",
+                    2 => "U32",
+                    3 => "VarUInt64",
+                    _ => "U16",
+                };
+                string endianEnum = isBe ? "Big" : "Little";
+                sb.Append(ind).Append("var __sl_").Append(idx).Append(" = this.").Append(m.Name).AppendLine(";");
+                sb.Append(ind).Append("if (__sl_").Append(idx).Append(".Offset < 0 || __sl_").Append(idx).Append(".Length < 0 || __sl_").Append(idx).AppendLine(".End > sourceBuffer.Length) { writer.Reset(__cp); return false; }");
+                sb.Append(ind).Append("var __savedEnd_").Append(idx).AppendLine(" = writer.Endianness;");
+                sb.Append(ind).Append("writer.Endianness = global::SpanForge.Endianness.").Append(endianEnum).AppendLine(";");
+                sb.Append(ind).Append("bool __ok_").Append(idx).Append(" = writer.TryWriteLengthPrefixedBytes(global::SpanForge.LengthPrefix.").Append(lpName).Append(", sourceBuffer.Slice(__sl_").Append(idx).Append(".Offset, __sl_").Append(idx).AppendLine(".Length));");
+                sb.Append(ind).Append("writer.Endianness = __savedEnd_").Append(idx).AppendLine(";");
+                sb.Append(ind).Append("if (!__ok_").Append(idx).AppendLine(") { writer.Reset(__cp); return false; }");
+                return;
+            }
+
+            case MemberKind.FixedSlice:
+                sb.Append(ind).Append("var __sl_").Append(idx).Append(" = this.").Append(m.Name).AppendLine(";");
+                sb.Append(ind).Append("if (__sl_").Append(idx).Append(".Length != ").Append(m.FixedBytes).Append(" || __sl_").Append(idx).Append(".Offset < 0 || __sl_").Append(idx).AppendLine(".End > sourceBuffer.Length) { writer.Reset(__cp); return false; }");
+                sb.Append(ind).Append("if (!writer.TryWriteBytes(sourceBuffer.Slice(__sl_").Append(idx).Append(".Offset, __sl_").Append(idx).AppendLine(".Length))) { writer.Reset(__cp); return false; }");
+                return;
+
+            case MemberKind.NestedBinaryStruct:
+                sb.Append(ind).Append("if (!this.").Append(m.Name).AppendLine(".TryWrite(ref writer, sourceBuffer)) { writer.Reset(__cp); return false; }");
+                return;
+        }
+
+        string writeCall = m.Kind switch
+        {
+            MemberKind.U8 => $"writer.TryWriteU8(this.{m.Name})",
+            MemberKind.I8 => $"writer.TryWriteI8(this.{m.Name})",
+            MemberKind.U16 => $"writer.TryWriteU16{suffix}(this.{m.Name})",
+            MemberKind.I16 => $"writer.TryWriteI16{suffix}(this.{m.Name})",
+            MemberKind.U32 => $"writer.TryWriteU32{suffix}(this.{m.Name})",
+            MemberKind.I32 => $"writer.TryWriteI32{suffix}(this.{m.Name})",
+            MemberKind.U64 => $"writer.TryWriteU64{suffix}(this.{m.Name})",
+            MemberKind.I64 => $"writer.TryWriteI64{suffix}(this.{m.Name})",
+            MemberKind.F32 => $"writer.TryWriteF32{suffix}(this.{m.Name})",
+            MemberKind.F64 => $"writer.TryWriteF64{suffix}(this.{m.Name})",
+            MemberKind.VarUInt64 => $"writer.TryWriteVarUInt64(this.{m.Name})",
+            MemberKind.VarInt64ZigZag => $"writer.TryWriteVarInt64(this.{m.Name})",
+            MemberKind.QuicVarUInt64 => $"writer.TryWriteQuicVarInt64(this.{m.Name})",
+            _ => throw new InvalidOperationException(),
+        };
+
+        sb.Append(ind).Append("if (!").Append(writeCall).AppendLine(") { writer.Reset(__cp); return false; }");
     }
 
     private static void EmitParserStructs(StringBuilder sb, TypeModel model, string ind)

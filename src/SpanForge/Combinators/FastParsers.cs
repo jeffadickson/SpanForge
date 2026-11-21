@@ -4,7 +4,7 @@ namespace SpanForge;
 
 /// <summary>
 /// Monomorphized value-type parser combinators returning the register-sized <see cref="ParseResult{T, TError}"/>
-/// (zero GC references when <typeparamref name="T"/> and <typeparamref name="TError"/> are unmanaged).
+/// (zero GC references when <c>T</c> and <c>TError</c> are unmanaged).
 /// Mirrors Rust's <c>winnow::Parser&lt;I, O, EmptyError&gt;</c>.
 /// </summary>
 public static class FastParsers

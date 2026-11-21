@@ -1,10 +1,29 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <PackageId>SpanForge</PackageId>
     <AssemblyName>SpanForge</AssemblyName>
     <RootNamespace>SpanForge</RootNamespace>
-    <Description>A zero-allocation, C# 15 union-powered Span and binary parser combinator library inspired by Rust's nom, winnow, binrw, and zerocopy.</Description>
+    <Description>A zero-allocation, C# 15 union-powered Span and binary parser/writer combinator library with compile-time source generation, inspired by Rust's nom, winnow, binrw, and zerocopy.</Description>
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="SpanForge.Protocols" />
+    <!-- Ensure the Roslyn source generator builds before packing SpanForge, without adding it as a package dependency -->
+    <ProjectReference Include="../SpanForge.Generators/SpanForge.Generators.csproj"
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="all"
+                      Condition="'$(PublishAot)' != 'true'" />
+    <None Include="../SpanForge.Generators/bin/$(Configuration)/netstandard2.0/SpanForge.Generators.dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

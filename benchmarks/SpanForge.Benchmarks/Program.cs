@@ -3,7 +3,10 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SpanForge;
+using SpanForge.Protocols.Http2;
+using SpanForge.Protocols.Mqtt;
 using SpanForge.Protocols.Png;
+using SpanForge.Protocols.Protobuf;
 using SpanForge.Protocols.WebSocket;
 
 const int RingSize = 256;
@@ -234,7 +237,223 @@ RunBench("tlv_stream16", "cs15/comb", TlvOps, tlvBytes, ops => BenchTlv(tlvRing,
 const int PngOps = 200_000;
 RunBench("png_chunks_crc", "cs15/spanforge", PngOps, pngBytes, ops => BenchPng(pngRing, ops));
 
+// 6. Protobuf wire message (6 mixed fields: varints, fixed64, fixed32, length-delimited)
+var pbRing = GenProtobufRing();
+const int PbOps = 500_000;
+RunBench("protobuf_msg", "cs15/spanforge", PbOps, pbRing[0].Length, ops => BenchProtobuf(pbRing, ops));
+
+// 7. HTTP/2 frame sequence (SETTINGS + HEADERS + DATA per op)
+var h2Ring = GenHttp2Ring();
+const int H2Ops = 500_000;
+RunBench("http2_frames", "cs15/spanforge", H2Ops, h2Ring[0].Length, ops => BenchHttp2(h2Ring, ops));
+
+// 8. MQTT v5.0 PUBLISH packet (QoS 1 + topic + packet ID + properties + payload)
+var mqttRing = GenMqttRing();
+const int MqttOps = 500_000;
+RunBench("mqtt5_publish", "cs15/spanforge", MqttOps, mqttRing[0].Length, ops => BenchMqtt(mqttRing, ops));
+
+// 9. Compile-time generated [BinaryStruct] TryParse + Parse/TryWriteTo roundtrip
+var genRing = GenBinaryStructRing();
+const int GenOps = 1_000_000;
+RunBench("gen_struct", "cs15/tryparse", GenOps, genRing[0].Length, ops => BenchGeneratedStructTryParse(genRing, ops));
+RunBench("gen_struct_rw", "cs15/roundtrip", GenOps, genRing[0].Length, ops => BenchGeneratedStructRoundtrip(genRing, ops));
+
 return;
+
+static byte[][] GenProtobufRing()
+{
+    var ring = new byte[RingSize][];
+    Span<byte> scratch = stackalloc byte[128];
+    for (int i = 0; i < RingSize; i++)
+    {
+        var w = scratch.AsWriter(Endianness.Little);
+        // Field 1 (varint): user id
+        w.TryWriteVarUInt64((1UL << 3) | 0);
+        w.TryWriteVarUInt64((ulong)(100_000 + i * 37));
+        // Field 2 (length-delimited): 12-byte name
+        w.TryWriteVarUInt64((2UL << 3) | 2);
+        w.TryWriteVarUInt64(12);
+        w.TryWriteBytes("spanforge_v1"u8);
+        // Field 3 (fixed64): timestamp
+        w.TryWriteVarUInt64((3UL << 3) | 1);
+        w.TryWriteU64LE(0x0102_0304_0506_0700UL | (uint)i);
+        // Field 4 (fixed32): score bits
+        w.TryWriteVarUInt64((4UL << 3) | 5);
+        w.TryWriteU32LE(0x3F80_0000u + (uint)i);
+        // Field 5 (varint): flags
+        w.TryWriteVarUInt64((5UL << 3) | 0);
+        w.TryWriteVarUInt64((ulong)(i & 0xFF));
+        // Field 6 (length-delimited): 8-byte payload
+        w.TryWriteVarUInt64((6UL << 3) | 2);
+        w.TryWriteVarUInt64(8);
+        w.TryWriteU64BE(0xAABB_CCDD_EEFF_0000UL | (uint)i);
+        ring[i] = w.Written.ToArray();
+    }
+    return ring;
+}
+
+static byte[][] GenHttp2Ring()
+{
+    var ring = new byte[RingSize][];
+    Span<byte> scratch = stackalloc byte[128];
+    for (int i = 0; i < RingSize; i++)
+    {
+        var w = scratch.AsWriter(Endianness.Big);
+        uint streamId = (uint)((i * 2) + 1);
+        // Frame 1: SETTINGS (6 bytes = 1 entry)
+        w.TryWriteU8(0); w.TryWriteU16BE(6); w.TryWriteU8((byte)Http2FrameType.Settings); w.TryWriteU8(0); w.TryWriteU32BE(0);
+        w.TryWriteU16BE(0x03); w.TryWriteU32BE(100u + (uint)i);
+        // Frame 2: HEADERS (10 bytes HPACK stub, END_HEADERS)
+        w.TryWriteU8(0); w.TryWriteU16BE(10); w.TryWriteU8((byte)Http2FrameType.Headers); w.TryWriteU8((byte)Http2FrameFlags.EndHeaders); w.TryWriteU32BE(streamId);
+        w.TryWriteBytes([0x82, 0x86, 0x84, 0x41, 0x05, (byte)'h', (byte)'e', (byte)'l', (byte)'l', (byte)'o']);
+        // Frame 3: DATA (16 bytes payload, END_STREAM)
+        w.TryWriteU8(0); w.TryWriteU16BE(16); w.TryWriteU8((byte)Http2FrameType.Data); w.TryWriteU8((byte)Http2FrameFlags.EndStream); w.TryWriteU32BE(streamId);
+        w.TryWriteU64BE(0x1122_3344_5566_7700UL | (uint)i);
+        w.TryWriteU64BE(0x8899_AABB_CCDD_EE00UL | (uint)i);
+        ring[i] = w.Written.ToArray();
+    }
+    return ring;
+}
+
+static byte[][] GenMqttRing()
+{
+    var ring = new byte[RingSize][];
+    Span<byte> scratch = stackalloc byte[128];
+    ReadOnlySpan<byte> topic = "sensors/floor1/temp"u8;
+    for (int i = 0; i < RingSize; i++)
+    {
+        // Remaining = 2 + topic(19) + 2(pktId) + 1(propsLen=0) + 16(payload) = 40 bytes
+        var w = scratch.AsWriter(Endianness.Big);
+        w.TryWriteU8(0x32); // PUBLISH, QoS 1
+        w.TryWriteU8(40);   // Remaining length (1-byte VBI)
+        w.TryWriteU16BE((ushort)topic.Length);
+        w.TryWriteBytes(topic);
+        w.TryWriteU16BE((ushort)(i + 1)); // PacketId
+        w.TryWriteU8(0); // Properties length = 0
+        w.TryWriteU64BE(0x4142_4344_4546_4700UL | (uint)i);
+        w.TryWriteU64BE(0x3031_3233_3435_3600UL | (uint)i);
+        ring[i] = w.Written.ToArray();
+    }
+    return ring;
+}
+
+static byte[][] GenBinaryStructRing()
+{
+    var ring = new byte[RingSize][];
+    ReadOnlySpan<byte> payload = "bench123"u8;
+    Span<byte> scratch = stackalloc byte[64];
+    for (int i = 0; i < RingSize; i++)
+    {
+        var rec = new BenchGeneratedPacket(
+            Kind: 7,
+            Port: (ushort)(8000 + i),
+            Timestamp: (uint)(1_700_000_000 + i),
+            Score: 100.5 + i,
+            Sequence: (ulong)(10_000 + i * 17),
+            Payload: new ByteSlice(0, payload.Length));
+        int written = rec.TryWriteTo(scratch, payload);
+        ring[i] = scratch[..written].ToArray();
+    }
+    return ring;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchProtobuf(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        while (!c.IsAtEnd)
+        {
+            if (ProtobufParser.ParseField(ref c).TryGetValue(out Parsed<ProtobufField> ok))
+            {
+                var f = ok.Value;
+                if (f.TryGetValue(out ProtobufVarIntField vi)) acc = unchecked(acc + vi.Value + vi.FieldNumber);
+                else if (f.TryGetValue(out ProtobufFixed64Field f64)) acc = unchecked(acc + f64.Bits);
+                else if (f.TryGetValue(out ProtobufFixed32Field f32)) acc = unchecked(acc + f32.Bits);
+                else if (f.TryGetValue(out ProtobufLengthDelimitedField ld)) acc = unchecked(acc + (ulong)ld.Payload.Length + buf[ld.Payload.Offset]);
+            }
+            else break;
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchHttp2(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        while (!c.IsAtEnd)
+        {
+            if (Http2FrameParser.ParseFrame(ref c).TryGetValue(out Parsed<Http2Frame> ok))
+            {
+                var f = ok.Value;
+                if (f.TryGetValue(out Http2SettingsFrame s)) acc = unchecked(acc + (ulong)s.Entries.Length);
+                else if (f.TryGetValue(out Http2HeadersFrame h)) acc = unchecked(acc + h.StreamId + (ulong)h.HeaderBlockFragment.Length);
+                else if (f.TryGetValue(out Http2DataFrame d)) acc = unchecked(acc + d.StreamId + (ulong)d.Data.Length + buf[d.Data.Offset]);
+            }
+            else break;
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchMqtt(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        if (MqttV5Parser.ParsePacket(ref c).TryGetValue(out Parsed<MqttPacket> ok) &&
+            ok.Value.TryGetValue(out MqttPublishPacket pub))
+        {
+            acc = unchecked(acc + (ulong)pub.TopicName.Length + (ulong)pub.Payload.Length + buf[pub.Payload.Offset]);
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchGeneratedStructTryParse(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        if (BenchGeneratedPacket.TryParse(ref c, out var pkt).IsParsed)
+        {
+            acc = unchecked(acc + pkt.Port + pkt.Timestamp + pkt.Sequence + (ulong)pkt.Payload.Length);
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchGeneratedStructRoundtrip(byte[][] ring, int ops)
+{
+    Span<byte> outBuf = stackalloc byte[64];
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        if (BenchGeneratedPacket.TryParse(ref c, out var pkt).IsParsed)
+        {
+            int n = pkt.TryWriteTo(outBuf, buf);
+            acc = unchecked(acc + (ulong)n + outBuf[n - 1]);
+        }
+    }
+    return acc;
+}
 
 // ============================================================================
 // Benchmark Kernels
@@ -932,3 +1151,14 @@ public readonly struct TryTlvFolder : ITryDispatchFolder<byte, ulong>
         return FastStatus.Backtrack;
     }
 }
+
+[BinaryStruct(Endianness.Big)]
+[Magic(0xAA)]
+public readonly partial record struct BenchGeneratedPacket(
+    [property: AssertValue(7)] byte Kind,
+    ushort Port,
+    uint Timestamp,
+    double Score,
+    [property: VarInt] ulong Sequence,
+    [property: LengthPrefixed(LengthPrefix.U16)] ByteSlice Payload);
+

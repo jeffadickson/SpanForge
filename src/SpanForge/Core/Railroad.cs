@@ -46,7 +46,7 @@ public static class RailroadExtensions
 
     /// <summary>
     /// Chains a subsequent <see cref="ByteCursor"/> parsing step on the happy track,
-    /// rolling back to <paramref name="rollbackCheckpoint"/> automatically if the continuation leaves the happy track.
+    /// rolling back <paramref name="cursor"/> automatically if the continuation leaves the happy track.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ParseResult<TOut> Then<T, TOut>(
