@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace SpanForge.Protocols.WebSocket;
 
@@ -515,16 +516,33 @@ public static class WebSocketFrameParser
             return;
         }
 
-        // Rotate big-endian mask key so byte 0 aligns with `maskOffset & 3`, then convert to native endianness for word XOR.
+        // Rotate big-endian mask key so byte 0 aligns with `maskOffset & 3`, then convert to native endianness for word/SIMD XOR.
         uint mBe = BitOperations.RotateLeft(key.Value, (maskOffset & 3) * 8);
         uint m32 = BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(mBe) : mBe;
-        ulong m64 = ((ulong)m32 << 32) | m32;
 
         ref byte src = ref MemoryMarshal.GetReference(raw);
         ref byte dst = ref MemoryMarshal.GetReference(destination);
         nuint i = 0;
         nuint uLen = (nuint)(uint)len;
 
+        if (Vector256.IsHardwareAccelerated)
+        {
+            Vector256<byte> mask256 = Vector256.Create(m32).AsByte();
+            while (i + 32 <= uLen)
+            {
+                (Vector256.LoadUnsafe(ref src, i) ^ mask256).StoreUnsafe(ref dst, i);
+                i += 32;
+            }
+        }
+
+        if (Vector128.IsHardwareAccelerated && i + 16 <= uLen)
+        {
+            Vector128<byte> mask128 = Vector128.Create(m32).AsByte();
+            (Vector128.LoadUnsafe(ref src, i) ^ mask128).StoreUnsafe(ref dst, i);
+            i += 16;
+        }
+
+        ulong m64 = ((ulong)m32 << 32) | m32;
         while (i + 8 <= uLen)
         {
             ulong v = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, i)) ^ m64;
@@ -532,18 +550,11 @@ public static class WebSocketFrameParser
             i += 8;
         }
 
-        if (i + 4 <= uLen)
-        {
-            uint v = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, i)) ^ m32;
-            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, i), v);
-            i += 4;
-        }
-
         int shift = 24;
         while (i < uLen)
         {
             Unsafe.Add(ref dst, i) = (byte)(Unsafe.Add(ref src, i) ^ (byte)(mBe >> shift));
-            shift -= 8;
+            shift = (shift - 8) & 24;
             i++;
         }
     }

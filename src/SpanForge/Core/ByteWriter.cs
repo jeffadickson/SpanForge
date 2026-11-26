@@ -351,8 +351,83 @@ public ref struct ByteWriter
     }
 
     /// <summary>
+    /// Reserves <paramref name="count"/> contiguous bytes in the destination buffer with a single bounds check,
+    /// returning the reserved slice and advancing <see cref="Position"/>.
+    /// Enables compile-time fixed-size bounds-check coalescing in generated writers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryReserve(int count, out Span<byte> span)
+    {
+        int pos = _position;
+        if (count < 0 || _buffer.Length - pos < count)
+        {
+            span = default;
+            return false;
+        }
+
+        span = MemoryMarshal.CreateSpan(
+            ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos),
+            count);
+        _position = pos + count;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryWriteLengthPrefixedU8(ReadOnlySpan<byte> data)
+    {
+        int len = data.Length;
+        int pos = _position;
+        if ((uint)len > byte.MaxValue || _buffer.Length - pos < 1 + len) return false;
+        ref byte dst = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos);
+        dst = (byte)len;
+        if (len > 0)
+        {
+            data.CopyTo(MemoryMarshal.CreateSpan(ref Unsafe.Add(ref dst, 1), len));
+        }
+        _position = pos + 1 + len;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryWriteLengthPrefixedU16BE(ReadOnlySpan<byte> data)
+    {
+        int len = data.Length;
+        int pos = _position;
+        if ((uint)len > ushort.MaxValue || _buffer.Length - pos < 2 + len) return false;
+        ref byte dst = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos);
+        ushort hdr = (ushort)len;
+        if (BitConverter.IsLittleEndian) hdr = BinaryPrimitives.ReverseEndianness(hdr);
+        Unsafe.WriteUnaligned(ref dst, hdr);
+        if (len > 0)
+        {
+            data.CopyTo(MemoryMarshal.CreateSpan(ref Unsafe.Add(ref dst, 2), len));
+        }
+        _position = pos + 2 + len;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryWriteLengthPrefixedU16LE(ReadOnlySpan<byte> data)
+    {
+        int len = data.Length;
+        int pos = _position;
+        if ((uint)len > ushort.MaxValue || _buffer.Length - pos < 2 + len) return false;
+        ref byte dst = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos);
+        ushort hdr = (ushort)len;
+        if (!BitConverter.IsLittleEndian) hdr = BinaryPrimitives.ReverseEndianness(hdr);
+        Unsafe.WriteUnaligned(ref dst, hdr);
+        if (len > 0)
+        {
+            data.CopyTo(MemoryMarshal.CreateSpan(ref Unsafe.Add(ref dst, 2), len));
+        }
+        _position = pos + 2 + len;
+        return true;
+    }
+
+    /// <summary>
     /// Writes a length prefix followed by <paramref name="data"/>. Rolls back if prefix overflows or buffer is too small.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryWriteLengthPrefixedBytes(LengthPrefix prefix, ReadOnlySpan<byte> data)
     {
         var cp = Save();
@@ -360,14 +435,12 @@ public ref struct ByteWriter
         switch (prefix)
         {
             case LengthPrefix.U8:
-                if (data.Length > byte.MaxValue) return false;
-                headerOk = TryWriteU8((byte)data.Length);
-                break;
+                return TryWriteLengthPrefixedU8(data);
 
             case LengthPrefix.U16:
-                if (data.Length > ushort.MaxValue) return false;
-                headerOk = TryWriteU16((ushort)data.Length);
-                break;
+                return _endianness == Endianness.Big
+                    ? TryWriteLengthPrefixedU16BE(data)
+                    : TryWriteLengthPrefixedU16LE(data);
 
             case LengthPrefix.U32:
                 headerOk = TryWriteU32((uint)data.Length);

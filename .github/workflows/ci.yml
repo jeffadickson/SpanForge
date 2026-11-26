@@ -104,3 +104,34 @@ jobs:
           name: stryker-report-${{ matrix.target }}
           path: tests/SpanForge.Tests/StrykerOutput/*/reports/*
           if-no-files-found: warn
+
+  dafny-verify:
+    name: Dafny Formal Verification (formal/)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dafny 4.11.0 (with bundled Z3)
+        shell: bash
+        run: |
+          curl -fsSL -o /tmp/dafny.zip \
+            https://github.com/dafny-lang/dafny/releases/download/v4.11.0/dafny-4.11.0-x64-ubuntu-22.04.zip
+          unzip -q /tmp/dafny.zip -d "$HOME/.local"
+          echo "$HOME/.local/dafny" >> "$GITHUB_PATH"
+          "$HOME/.local/dafny/dafny" --version
+
+      - name: Verify all Dafny formal proofs
+        shell: bash
+        run: |
+          dafny verify --verification-time-limit=30 \
+            formal/CursorSoundness.dfy \
+            formal/CodecBijections.dfy \
+            formal/DnsTermination.dfy \
+            formal/StreamingAndProtocols.dfy
+
+      - name: Verify C# differential oracle matches verified Dafny specs
+        shell: bash
+        run: ./formal/generate-oracle.sh --check
+

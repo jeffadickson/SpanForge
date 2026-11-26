@@ -492,25 +492,85 @@ public sealed class BinaryUnionGenerator : IIncrementalGenerator
     private static void EmitTryParseMethod(StringBuilder sb, UnionModel model, string ind)
     {
         string fq = model.FullyQualifiedName;
+        string suffix = model.DefaultEndianness == 0 ? "BE" : "LE";
         string inner = ind + "    ";
 
         sb.Append(ind).AppendLine("[MethodImpl(MethodImplOptions.AggressiveInlining)]");
         sb.Append(ind).Append("public static global::SpanForge.FastStatus TryParse(ref global::SpanForge.ByteCursor cursor, out ").Append(fq).AppendLine(" value)");
         sb.Append(ind).AppendLine("{");
-        sb.Append(inner).AppendLine("var __res = Parse(ref cursor);");
-        sb.Append(inner).Append("if (__res.TryGetValue(out global::SpanForge.Parsed<").Append(fq).AppendLine("> __ok))");
+        sb.Append(inner).AppendLine("int __start = cursor.Position;");
+
+        if (model.TypeMagic is { Length: > 0 } tm)
+        {
+            if (tm.Length == 1)
+            {
+                sb.Append(inner).Append("var __tm = cursor.TryTagByte(").Append(tm[0]).AppendLine(", out _);");
+            }
+            else
+            {
+                sb.Append(inner).Append("var __tm = cursor.TryTag([");
+                for (int k = 0; k < tm.Length; k++)
+                {
+                    if (k > 0) sb.Append(", ");
+                    sb.Append("0x").Append(tm[k].ToString("X2"));
+                }
+                sb.AppendLine("]);");
+            }
+            sb.Append(inner).AppendLine("if (!__tm.IsParsed) { Unsafe.SkipInit(out value); return __tm; }");
+        }
+
+        string tagCall = model.TagWidth switch
+        {
+            0 => "cursor.TryReadU8(out byte __tagRaw)",
+            1 => $"cursor.TryReadU16{suffix}(out ushort __tagRaw)",
+            2 => $"cursor.TryReadU32{suffix}(out uint __tagRaw)",
+            _ => "cursor.TryReadU8(out byte __tagRaw)",
+        };
+
+        sb.Append(inner).Append("var __tagSt = ").Append(tagCall).AppendLine(";");
+        sb.Append(inner).AppendLine("if (!__tagSt.IsParsed) { cursor.Position = __start; Unsafe.SkipInit(out value); return __tagSt; }");
+        sb.Append(inner).AppendLine("uint __wireTag = __tagRaw;");
+        sb.Append(inner).AppendLine("switch (__wireTag)");
         sb.Append(inner).AppendLine("{");
-        sb.Append(inner).AppendLine("    value = __ok.Value;");
-        sb.Append(inner).AppendLine("    return global::SpanForge.FastStatus.Parsed;");
+
+        string caseInd = inner + "    ";
+        string caseBodyInd = caseInd + "    ";
+
+        for (int i = 0; i < model.Cases.Length; i++)
+        {
+            UnionCaseModel c = model.Cases[i];
+            sb.Append(caseInd).Append("case ").Append(c.Tag).AppendLine("u:");
+            sb.Append(caseInd).AppendLine("{");
+
+            string call = c.Kind switch
+            {
+                CaseKind.BoolByte => "cursor.TryReadBool(out bool __p)",
+                CaseKind.U8 => "cursor.TryReadU8(out byte __p)",
+                CaseKind.I8 => "cursor.TryReadI8(out sbyte __p)",
+                CaseKind.U16 => $"cursor.TryReadU16{suffix}(out ushort __p)",
+                CaseKind.I16 => $"cursor.TryReadI16{suffix}(out short __p)",
+                CaseKind.U32 => $"cursor.TryReadU32{suffix}(out uint __p)",
+                CaseKind.I32 => $"cursor.TryReadI32{suffix}(out int __p)",
+                CaseKind.U64 => $"cursor.TryReadU64{suffix}(out ulong __p)",
+                CaseKind.I64 => $"cursor.TryReadI64{suffix}(out long __p)",
+                CaseKind.F32 => $"cursor.TryReadF32{suffix}(out float __p)",
+                CaseKind.F64 => $"cursor.TryReadF64{suffix}(out double __p)",
+                CaseKind.NestedBinary => $"{c.PayloadTypeName}.TryParse(ref cursor, out {c.PayloadTypeName} __p)",
+                _ => throw new InvalidOperationException(),
+            };
+
+            sb.Append(caseBodyInd).Append("var __s = ").Append(call).AppendLine(";");
+            sb.Append(caseBodyInd).AppendLine("if (!__s.IsParsed) { cursor.Position = __start; Unsafe.SkipInit(out value); return __s; }");
+            sb.Append(caseBodyInd).Append("value = new ").Append(fq).AppendLine("(__p);");
+            sb.Append(caseBodyInd).AppendLine("return global::SpanForge.FastStatus.Parsed;");
+            sb.Append(caseInd).AppendLine("}");
+        }
+
+        sb.Append(caseInd).AppendLine("default:");
+        sb.Append(caseBodyInd).AppendLine("cursor.Position = __start;");
+        sb.Append(caseBodyInd).AppendLine("Unsafe.SkipInit(out value);");
+        sb.Append(caseBodyInd).AppendLine("return global::SpanForge.FastStatus.Backtrack;");
         sb.Append(inner).AppendLine("}");
-        sb.Append(inner).AppendLine("Unsafe.SkipInit(out value);");
-        sb.Append(inner).AppendLine("if (__res.TryGetValue(out global::SpanForge.Incomplete __inc))");
-        sb.Append(inner).AppendLine("{");
-        sb.Append(inner).AppendLine("    return __inc.Needed.TryGetValue(out global::SpanForge.ExactBytes __ex)");
-        sb.Append(inner).AppendLine("        ? global::SpanForge.FastStatus.IncompleteBytes(__ex.Count)");
-        sb.Append(inner).AppendLine("        : global::SpanForge.FastStatus.IncompleteUnknown;");
-        sb.Append(inner).AppendLine("}");
-        sb.Append(inner).AppendLine("return __res.IsFailure ? global::SpanForge.FastStatus.Failure : global::SpanForge.FastStatus.Backtrack;");
         sb.Append(ind).AppendLine("}");
     }
 

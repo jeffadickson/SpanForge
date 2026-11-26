@@ -1,6 +1,8 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace SpanForge.Protocols.Png;
 
@@ -109,28 +111,28 @@ public readonly struct PngChunk : IUnion
     public bool TryGetValue(out IhdrChunk value)
     {
         if (_tag == 1) { value = UnpackIhdr(); return true; }
-        value = default; return false;
+        Unsafe.SkipInit(out value); return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out PlteChunk value)
     {
         if (_tag == 2) { value = new PlteChunk(new ByteSlice((int)_a, (int)_b)); return true; }
-        value = default; return false;
+        Unsafe.SkipInit(out value); return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out IdatChunk value)
     {
         if (_tag == 3) { value = new IdatChunk(new ByteSlice((int)_a, (int)_b)); return true; }
-        value = default; return false;
+        Unsafe.SkipInit(out value); return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetValue(out TextChunk value)
     {
         if (_tag == 4) { value = new TextChunk(new ByteSlice((int)_a, (int)_b), new ByteSlice((int)_c, (int)_d)); return true; }
-        value = default; return false;
+        Unsafe.SkipInit(out value); return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -144,15 +146,15 @@ public readonly struct PngChunk : IUnion
     public bool TryGetValue(out UnknownChunk value)
     {
         if (_tag == 6) { value = new UnknownChunk(_a, new ByteSlice((int)_b, (int)_c)); return true; }
-        value = default; return false;
+        Unsafe.SkipInit(out value); return false;
     }
 }
 
 public sealed record class PngDocument(IhdrChunk Header, IReadOnlyList<PngChunk> Chunks);
 
 /// <summary>
-/// Zero-copy PNG binary parser with slicing-by-8 CRC-32 validation, streaming chunk support,
-/// and exhaustive zero-boxing C# 15 <c>[Union] PngChunk</c> results.
+/// Zero-copy PNG binary parser with hardware PCLMULQDQ / Arm.Crc32 + slicing-by-8 CRC-32 validation,
+/// streaming chunk support, zero-GC-ref <see cref="TryParseChunk"/> fast paths, and exhaustive zero-boxing C# 15 <c>[Union] PngChunk</c> results.
 /// </summary>
 public static class PngParser
 {
@@ -166,8 +168,134 @@ public static class PngParser
 
     private static readonly uint[] CrcTableFlat = BuildCrcTableFlat();
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public static ParseResult<ByteSlice> ParseSignature(ref ByteCursor cursor) =>
         cursor.Tag(Signature).WithContext("PNG 8-byte magic signature");
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryParseSignature(ref ByteCursor cursor) =>
+        cursor.TryTag(Signature);
+
+    /// <summary>
+    /// High-throughput zero-GC-ref <see cref="FastStatus"/> entry point for decoding a single PNG chunk with CRC-32 verification.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryParseChunk(ref ByteCursor cursor, out PngChunk chunk)
+    {
+        int start = cursor.Position;
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        int rem = buf.Length - start;
+        if (rem < 12)
+        {
+            Unsafe.SkipInit(out chunk);
+            if (rem >= 4)
+            {
+                uint rLen = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref MemoryMarshal.GetReference(buf), (nint)(uint)start));
+                if (BitConverter.IsLittleEndian) rLen = BinaryPrimitives.ReverseEndianness(rLen);
+                if (rLen > int.MaxValue - 12) return FastStatus.Failure;
+            }
+
+            if (cursor.Mode == InputMode.Streaming)
+            {
+                int need = rem < 4 ? 4 - rem : (rem < 8 ? 8 - rem : 12 - rem);
+                return FastStatus.IncompleteBytes(need);
+            }
+
+            return FastStatus.Backtrack;
+        }
+
+        ref byte ptr = ref Unsafe.Add(ref MemoryMarshal.GetReference(buf), (nint)(uint)start);
+        uint rawLen = Unsafe.ReadUnaligned<uint>(ref ptr);
+        uint typeCode = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ptr, 4));
+        if (BitConverter.IsLittleEndian)
+        {
+            rawLen = BinaryPrimitives.ReverseEndianness(rawLen);
+            typeCode = BinaryPrimitives.ReverseEndianness(typeCode);
+        }
+
+        if (rawLen > int.MaxValue - 12)
+        {
+            Unsafe.SkipInit(out chunk);
+            return FastStatus.Failure;
+        }
+
+        int dataLength = (int)rawLen;
+        int totalLength = 12 + dataLength;
+        if (rem < totalLength)
+        {
+            Unsafe.SkipInit(out chunk);
+            return cursor.Mode == InputMode.Streaming
+                ? FastStatus.IncompleteBytes(totalLength - rem)
+                : FastStatus.Backtrack;
+        }
+
+        uint expectedCrc = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref ptr, (nint)(uint)(8 + dataLength)));
+        if (BitConverter.IsLittleEndian)
+        {
+            expectedCrc = BinaryPrimitives.ReverseEndianness(expectedCrc);
+        }
+
+        uint computedCrc = ComputeCrc32Ref(ref Unsafe.Add(ref ptr, 4), 4 + dataLength);
+        if (computedCrc != expectedCrc)
+        {
+            Unsafe.SkipInit(out chunk);
+            return FastStatus.Failure;
+        }
+
+        var dataSlice = new ByteSlice(start + 8, dataLength);
+        ReadOnlySpan<byte> payload = MemoryMarshal.CreateReadOnlySpan(ref Unsafe.Add(ref ptr, 8), dataLength);
+
+        switch (typeCode)
+        {
+            case TypeIhdr:
+            {
+                if (dataLength != 13) { Unsafe.SkipInit(out chunk); return FastStatus.Failure; }
+                uint width = BinaryPrimitives.ReadUInt32BigEndian(payload);
+                uint height = BinaryPrimitives.ReadUInt32BigEndian(payload.Slice(4, 4));
+                byte colorTypeRaw = payload[9];
+                if (width == 0 || height == 0 || colorTypeRaw is not (0 or 2 or 3 or 4 or 6))
+                {
+                    Unsafe.SkipInit(out chunk);
+                    return FastStatus.Failure;
+                }
+
+                cursor.Position = start + totalLength;
+                chunk = new IhdrChunk(width, height, payload[8], (PngColorType)colorTypeRaw, payload[10], payload[11], payload[12]);
+                return FastStatus.Parsed;
+            }
+
+            case TypePlte:
+                if (dataLength == 0 || dataLength % 3 != 0) { Unsafe.SkipInit(out chunk); return FastStatus.Failure; }
+                cursor.Position = start + totalLength;
+                chunk = new PlteChunk(dataSlice);
+                return FastStatus.Parsed;
+
+            case TypeIdat:
+                cursor.Position = start + totalLength;
+                chunk = new IdatChunk(dataSlice);
+                return FastStatus.Parsed;
+
+            case TypeText:
+            {
+                int nul = payload.IndexOf((byte)0);
+                if (nul < 0) { Unsafe.SkipInit(out chunk); return FastStatus.Failure; }
+                cursor.Position = start + totalLength;
+                chunk = new TextChunk(new ByteSlice(dataSlice.Offset, nul), new ByteSlice(dataSlice.Offset + nul + 1, dataLength - nul - 1));
+                return FastStatus.Parsed;
+            }
+
+            case TypeIend:
+                if (dataLength != 0) { Unsafe.SkipInit(out chunk); return FastStatus.Failure; }
+                cursor.Position = start + totalLength;
+                chunk = default(IendChunk);
+                return FastStatus.Parsed;
+
+            default:
+                cursor.Position = start + totalLength;
+                chunk = new UnknownChunk(typeCode, dataSlice);
+                return FastStatus.Parsed;
+        }
+    }
 
     /// <summary>
     /// Parses a single PNG chunk (works in both <see cref="InputMode.Complete"/> and <see cref="InputMode.Streaming"/>).
@@ -377,17 +505,84 @@ public static class PngParser
         return new Parsed<PngDocument>(new PngDocument(header, chunks));
     }
 
-    /// <summary>Computes IEEE 802.3 CRC-32 using flat slicing-by-8+4 lookup tables (zero allocations, zero inner bounds checks).</summary>
+    /// <summary>Computes IEEE 802.3 CRC-32 using hardware PCLMULQDQ / Arm.Crc32 when beneficial, falling back to flat slicing-by-8+4 lookup tables (zero allocations, zero inner bounds checks).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static uint ComputeCrc32(ReadOnlySpan<byte> data)
+    public static uint ComputeCrc32(ReadOnlySpan<byte> data) =>
+        ComputeCrc32Ref(ref MemoryMarshal.GetReference(data), data.Length);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint ComputeCrc32Ref(ref byte src, int len)
+    {
+        if (Pclmulqdq.IsSupported && Sse41.IsSupported && BitConverter.IsLittleEndian && len >= 64)
+        {
+            return ComputeCrc32Pclmul(ref src, len);
+        }
+
+        return ComputeCrc32Slicing(ref src, 0, (nuint)(uint)len, 0xFFFF_FFFFu);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static uint ComputeCrc32Pclmul(ref byte src, int len)
+    {
+        nuint uLen = (nuint)(uint)len;
+
+        // Intel whitepaper "Fast CRC Computation for Generic Polynomials Using PCLMULQDQ Instruction" (reflected IEEE 802.3)
+        Vector128<ulong> k1k2 = Vector128.Create(0x0154442bd4UL, 0x01c6e41596UL);
+        Vector128<ulong> k3k4 = Vector128.Create(0x01751997d0UL, 0x00ccaa009eUL);
+
+        Vector128<ulong> x0 = Vector128.LoadUnsafe(ref src, 0).AsUInt64() ^ Vector128.Create(0xFFFF_FFFFUL, 0UL);
+        Vector128<ulong> x1 = Vector128.LoadUnsafe(ref src, 16).AsUInt64();
+        Vector128<ulong> x2 = Vector128.LoadUnsafe(ref src, 32).AsUInt64();
+        Vector128<ulong> x3 = Vector128.LoadUnsafe(ref src, 48).AsUInt64();
+
+        nuint i = 64;
+        while (i + 64 <= uLen)
+        {
+            x0 = Pclmulqdq.CarrylessMultiply(x0, k1k2, 0x00) ^ Pclmulqdq.CarrylessMultiply(x0, k1k2, 0x11) ^ Vector128.LoadUnsafe(ref src, i).AsUInt64();
+            x1 = Pclmulqdq.CarrylessMultiply(x1, k1k2, 0x00) ^ Pclmulqdq.CarrylessMultiply(x1, k1k2, 0x11) ^ Vector128.LoadUnsafe(ref src, i + 16).AsUInt64();
+            x2 = Pclmulqdq.CarrylessMultiply(x2, k1k2, 0x00) ^ Pclmulqdq.CarrylessMultiply(x2, k1k2, 0x11) ^ Vector128.LoadUnsafe(ref src, i + 32).AsUInt64();
+            x3 = Pclmulqdq.CarrylessMultiply(x3, k1k2, 0x00) ^ Pclmulqdq.CarrylessMultiply(x3, k1k2, 0x11) ^ Vector128.LoadUnsafe(ref src, i + 48).AsUInt64();
+            i += 64;
+        }
+
+        // Fold 4x128-bit lanes down to 1x128-bit lane
+        x1 = Pclmulqdq.CarrylessMultiply(x0, k3k4, 0x00) ^ Pclmulqdq.CarrylessMultiply(x0, k3k4, 0x11) ^ x1;
+        x2 = Pclmulqdq.CarrylessMultiply(x1, k3k4, 0x00) ^ Pclmulqdq.CarrylessMultiply(x1, k3k4, 0x11) ^ x2;
+        x3 = Pclmulqdq.CarrylessMultiply(x2, k3k4, 0x00) ^ Pclmulqdq.CarrylessMultiply(x2, k3k4, 0x11) ^ x3;
+
+        while (i + 16 <= uLen)
+        {
+            x3 = Pclmulqdq.CarrylessMultiply(x3, k3k4, 0x00) ^ Pclmulqdq.CarrylessMultiply(x3, k3k4, 0x11) ^ Vector128.LoadUnsafe(ref src, i).AsUInt64();
+            i += 16;
+        }
+
+        // Fold 128 -> 64 bits
+        Vector128<ulong> x = Pclmulqdq.CarrylessMultiply(x3, k3k4, 0x10)
+            ^ Sse2.ShiftRightLogical128BitLane(x3.AsByte(), 8).AsUInt64();
+
+        Vector128<ulong> mask32 = Vector128.Create(0xFFFF_FFFFUL, 0UL);
+        Vector128<ulong> k6 = Vector128.Create(0x0163cd6124UL, 0UL);
+        x = Pclmulqdq.CarrylessMultiply(x & mask32, k6, 0x00)
+            ^ Sse2.ShiftRightLogical128BitLane(x.AsByte(), 4).AsUInt64();
+
+        // Barrett reduction: 64 -> 32 bits
+        Vector128<ulong> muP = Vector128.Create(0x01f7011641UL, 0x01db710641UL);
+        Vector128<ulong> q = Pclmulqdq.CarrylessMultiply(x & mask32, muP, 0x00);
+        Vector128<ulong> p = Pclmulqdq.CarrylessMultiply(q & mask32, muP, 0x10);
+        uint crc = (x ^ p).AsUInt32().GetElement(1);
+
+        if (i < uLen)
+        {
+            return ComputeCrc32Slicing(ref src, i, uLen, crc);
+        }
+
+        return ~crc;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint ComputeCrc32Slicing(ref byte src, nuint i, nuint uLen, uint crc)
     {
         ref uint t = ref MemoryMarshal.GetArrayDataReference(CrcTableFlat);
-        ref byte src = ref MemoryMarshal.GetReference(data);
-        int len = data.Length;
-
-        uint crc = 0xFFFF_FFFFu;
-        nuint i = 0;
-        nuint uLen = (nuint)(uint)len;
 
         while (i + 8 <= uLen)
         {

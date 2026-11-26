@@ -71,9 +71,11 @@ public readonly struct Http2Frame : IUnion
         _auxByte2 = auxByte2;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2DataFrame f)
         : this(1, f.Data, f.StreamId, 0, f.Flags, f.PadLength, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2HeadersFrame f)
     {
         _tag = 2;
@@ -94,30 +96,39 @@ public readonly struct Http2Frame : IUnion
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2PriorityFrame f)
         : this(3, default, f.StreamId, f.Priority.StreamDependency, Http2FrameFlags.None, f.Priority.Weight, (byte)(f.Priority.Exclusive ? 2 : 0)) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2RstStreamFrame f)
         : this(4, default, f.StreamId, f.ErrorCode, Http2FrameFlags.None, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2SettingsFrame f)
         : this(5, f.Entries, 0, 0, f.Flags, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2PushPromiseFrame f)
         : this(6, f.HeaderBlockFragment, f.StreamId, f.PromisedStreamId, f.Flags, f.PadLength, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2PingFrame f)
         : this(7, default, f.OpaqueData, 0, f.Flags, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2GoAwayFrame f)
         : this(8, f.DebugData, f.LastStreamId, f.ErrorCode, Http2FrameFlags.None, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2WindowUpdateFrame f)
         : this(9, default, f.StreamId, f.WindowSizeIncrement, Http2FrameFlags.None, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2ContinuationFrame f)
         : this(10, f.HeaderBlockFragment, f.StreamId, 0, f.Flags, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Http2Frame(Http2UnknownFrame f)
         : this(11, f.Payload, f.StreamId, 0, f.Flags, f.RawType, 0) { }
 
@@ -226,7 +237,7 @@ public readonly struct Http2Frame : IUnion
 /// <summary>
 /// Zero-allocation RFC 9113 HTTP/2 binary frame parser supporting client preface validation,
 /// streaming <see cref="Incomplete"/> decoding, strict frame-size / stream-ID / padding guards,
-/// and zero-copy <see cref="ByteSlice"/> payload views.
+/// zero-copy <see cref="ByteSlice"/> payload views, and zero-GC-ref <see cref="TryParseFrame"/> fast paths.
 /// </summary>
 public static class Http2FrameParser
 {
@@ -237,6 +248,220 @@ public static class Http2FrameParser
 
     public static ParseResult<ByteSlice> ParseClientPreface(ref ByteCursor cursor) =>
         cursor.Tag(ClientConnectionPreface);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryParseClientPreface(ref ByteCursor cursor) =>
+        cursor.TryTag(ClientConnectionPreface);
+
+    /// <summary>
+    /// High-throughput zero-GC-ref <see cref="FastStatus"/> entry point for RFC 9113 HTTP/2 frame decoding.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryParseFrame(
+        ref ByteCursor cursor,
+        out Http2Frame frame,
+        int maxFrameSize = DefaultMaxFrameSize)
+    {
+        int start = cursor.Position;
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        int rem = buf.Length - start;
+        if (rem < FrameHeaderSize)
+        {
+            Unsafe.SkipInit(out frame);
+            return cursor.Mode == InputMode.Streaming
+                ? FastStatus.IncompleteBytes(FrameHeaderSize - rem)
+                : FastStatus.Backtrack;
+        }
+
+        ref byte hdr = ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buf), (nint)(uint)start);
+        int payloadLength = (hdr << 16) | (Unsafe.Add(ref hdr, 1) << 8) | Unsafe.Add(ref hdr, 2);
+        byte rawType = Unsafe.Add(ref hdr, 3);
+        var flags = (Http2FrameFlags)Unsafe.Add(ref hdr, 4);
+        uint rawSid = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref hdr, 5));
+        if (BitConverter.IsLittleEndian) rawSid = BinaryPrimitives.ReverseEndianness(rawSid);
+        uint streamId = rawSid & 0x7FFF_FFFFu;
+
+        if (payloadLength > maxFrameSize)
+        {
+            Unsafe.SkipInit(out frame);
+            return FastStatus.Failure;
+        }
+
+        int totalLen = FrameHeaderSize + payloadLength;
+        if (rem < totalLen)
+        {
+            Unsafe.SkipInit(out frame);
+            return cursor.Mode == InputMode.Streaming
+                ? FastStatus.IncompleteBytes(totalLen - rem)
+                : FastStatus.Backtrack;
+        }
+
+        int payloadStart = start + FrameHeaderSize;
+        ref byte p = ref Unsafe.Add(ref hdr, FrameHeaderSize);
+
+        switch ((Http2FrameType)rawType)
+        {
+            case Http2FrameType.Data:
+            {
+                if (streamId == 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                byte padLen = 0;
+                int dataStart = payloadStart;
+                int dataLen = payloadLength;
+                if ((flags & Http2FrameFlags.Padded) != 0)
+                {
+                    if (payloadLength < 1) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                    padLen = p;
+                    dataStart = payloadStart + 1;
+                    dataLen = payloadLength - 1 - padLen;
+                    if (dataLen < 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                }
+
+                cursor.Position = start + totalLen;
+                frame = new Http2DataFrame(streamId, flags, new ByteSlice(dataStart, dataLen), padLen);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.Headers:
+            {
+                if (streamId == 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                int bodyOffset = 0;
+                int bodyEnd = payloadLength;
+                byte padLen = 0;
+                if ((flags & Http2FrameFlags.Padded) != 0)
+                {
+                    if (payloadLength < 1) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                    padLen = p;
+                    bodyOffset = 1;
+                    bodyEnd = payloadLength - padLen;
+                }
+
+                Option<Http2PrioritySpec> priority = Option<Http2PrioritySpec>.Nothing;
+                if ((flags & Http2FrameFlags.Priority) != 0)
+                {
+                    if (bodyEnd - bodyOffset < 5) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                    uint depRaw = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref p, bodyOffset));
+                    if (BitConverter.IsLittleEndian) depRaw = BinaryPrimitives.ReverseEndianness(depRaw);
+                    priority = Option<Http2PrioritySpec>.Of(new Http2PrioritySpec(
+                        (depRaw & 0x8000_0000u) != 0,
+                        depRaw & 0x7FFF_FFFFu,
+                        Unsafe.Add(ref p, bodyOffset + 4)));
+                    bodyOffset += 5;
+                }
+
+                if (bodyEnd < bodyOffset) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                cursor.Position = start + totalLen;
+                frame = new Http2HeadersFrame(streamId, flags, priority, new ByteSlice(payloadStart + bodyOffset, bodyEnd - bodyOffset), padLen);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.Settings:
+            {
+                if (streamId != 0 || ((flags & Http2FrameFlags.Ack) != 0 && payloadLength != 0) || (payloadLength % 6) != 0)
+                {
+                    Unsafe.SkipInit(out frame);
+                    return FastStatus.Failure;
+                }
+
+                cursor.Position = start + totalLen;
+                frame = new Http2SettingsFrame(flags, new ByteSlice(payloadStart, payloadLength));
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.WindowUpdate:
+            {
+                if (payloadLength != 4) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                uint rawInc = Unsafe.ReadUnaligned<uint>(ref p);
+                if (BitConverter.IsLittleEndian) rawInc = BinaryPrimitives.ReverseEndianness(rawInc);
+                uint inc = rawInc & 0x7FFF_FFFFu;
+                if (inc == 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                cursor.Position = start + totalLen;
+                frame = new Http2WindowUpdateFrame(streamId, inc);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.Ping:
+            {
+                if (streamId != 0 || payloadLength != 8) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                ulong opaque = Unsafe.ReadUnaligned<ulong>(ref p);
+                if (BitConverter.IsLittleEndian) opaque = BinaryPrimitives.ReverseEndianness(opaque);
+                cursor.Position = start + totalLen;
+                frame = new Http2PingFrame(flags, opaque);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.Priority:
+            {
+                if (streamId == 0 || payloadLength != 5) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                uint depRaw = Unsafe.ReadUnaligned<uint>(ref p);
+                if (BitConverter.IsLittleEndian) depRaw = BinaryPrimitives.ReverseEndianness(depRaw);
+                cursor.Position = start + totalLen;
+                frame = new Http2PriorityFrame(streamId, new Http2PrioritySpec((depRaw & 0x8000_0000u) != 0, depRaw & 0x7FFF_FFFFu, Unsafe.Add(ref p, 4)));
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.RstStream:
+            {
+                if (streamId == 0 || payloadLength != 4) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                uint errorCode = Unsafe.ReadUnaligned<uint>(ref p);
+                if (BitConverter.IsLittleEndian) errorCode = BinaryPrimitives.ReverseEndianness(errorCode);
+                cursor.Position = start + totalLen;
+                frame = new Http2RstStreamFrame(streamId, errorCode);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.PushPromise:
+            {
+                if (streamId == 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                int bodyOffset = 0;
+                int bodyEnd = payloadLength;
+                byte padLen = 0;
+                if ((flags & Http2FrameFlags.Padded) != 0)
+                {
+                    if (payloadLength < 1) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                    padLen = p;
+                    bodyOffset = 1;
+                    bodyEnd = payloadLength - padLen;
+                }
+
+                if (bodyEnd - bodyOffset < 4) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                uint rawPid = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref p, bodyOffset));
+                if (BitConverter.IsLittleEndian) rawPid = BinaryPrimitives.ReverseEndianness(rawPid);
+                bodyOffset += 4;
+                cursor.Position = start + totalLen;
+                frame = new Http2PushPromiseFrame(streamId, flags, rawPid & 0x7FFF_FFFFu, new ByteSlice(payloadStart + bodyOffset, bodyEnd - bodyOffset), padLen);
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.GoAway:
+            {
+                if (streamId != 0 || payloadLength < 8) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                uint lsid = Unsafe.ReadUnaligned<uint>(ref p);
+                uint err = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref p, 4));
+                if (BitConverter.IsLittleEndian)
+                {
+                    lsid = BinaryPrimitives.ReverseEndianness(lsid);
+                    err = BinaryPrimitives.ReverseEndianness(err);
+                }
+
+                cursor.Position = start + totalLen;
+                frame = new Http2GoAwayFrame(lsid & 0x7FFF_FFFFu, err, new ByteSlice(payloadStart + 8, payloadLength - 8));
+                return FastStatus.Parsed;
+            }
+
+            case Http2FrameType.Continuation:
+            {
+                if (streamId == 0) { Unsafe.SkipInit(out frame); return FastStatus.Failure; }
+                cursor.Position = start + totalLen;
+                frame = new Http2ContinuationFrame(streamId, flags, new ByteSlice(payloadStart, payloadLength));
+                return FastStatus.Parsed;
+            }
+
+            default:
+                cursor.Position = start + totalLen;
+                frame = new Http2UnknownFrame(rawType, flags, streamId, new ByteSlice(payloadStart, payloadLength));
+                return FastStatus.Parsed;
+        }
+    }
 
     public static ParseResult<Http2Frame> ParseFrame(
         ref ByteCursor cursor,

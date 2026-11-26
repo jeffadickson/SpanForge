@@ -78,12 +78,15 @@ public readonly struct MqttPacket : IUnion
         _b1 = b1;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttConnectPacket p)
         : this(1, p.Properties, p.Payload, default, p.KeepAlive, p.ProtocolLevel, p.ConnectFlags) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttConnAckPacket p)
         : this(2, p.Properties, default, default, 0, p.SessionPresent ? (byte)1 : (byte)0, p.ReasonCode) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttPublishPacket p)
     {
         _tag = 3;
@@ -103,21 +106,27 @@ public readonly struct MqttPacket : IUnion
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttPubAckPacket p)
         : this(4, p.Properties, default, default, p.PacketId, p.ReasonCode, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttSubscribePacket p)
         : this(5, p.Properties, p.TopicFilters, default, p.PacketId, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttSubAckPacket p)
         : this(6, p.Properties, p.ReasonCodes, default, p.PacketId, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttPingReqPacket _)
         : this(7, default, default, default, 0, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttPingRespPacket _)
         : this(8, default, default, default, 0, 0, 0) { }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MqttPacket(MqttDisconnectPacket p)
         : this(9, p.Properties, default, default, 0, p.ReasonCode, 0) { }
 
@@ -214,41 +223,374 @@ public readonly struct MqttPacket : IUnion
 
 /// <summary>
 /// Zero-allocation OASIS MQTT v5.0 control packet parser supporting streaming <see cref="Incomplete"/>
-/// decoding, MQTT 1–4 byte Variable Byte Integer remaining length, strict fixed-header flag validation,
-/// and MQTT v5 property slices.
+/// decoding, unrolled MQTT 1–4 byte Variable Byte Integer remaining length, strict fixed-header flag validation,
+/// MQTT v5 property slices, and zero-GC-ref <see cref="TryParsePacket"/> fast paths.
 /// </summary>
 public static class MqttV5Parser
 {
     public const int MaxVariableByteInt = 268_435_455; // (1 << 28) - 1 per MQTT 5.0 §1.5.5
 
-    /// <summary>Reads an MQTT 5.0 1..4 byte Variable Byte Integer (up to 268,435,455).</summary>
-    public static ParseResult<int> ReadVariableByteInt(ref ByteCursor cursor)
+    /// <summary>
+    /// Unrolled 1–4 byte MQTT 5.0 Variable Byte Integer decoder returning zero-GC-ref <see cref="FastStatus"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryReadVariableByteInt(ref ByteCursor cursor, out int value)
     {
-        var cp = cursor.Save();
-        int value = 0;
-        int shift = 0;
-
-        for (int i = 0; i < 4; i++)
+        int pos = cursor.Position;
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        ref byte baseRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buf);
+        var st = TryReadVbiCore(ref baseRef, pos, buf.Length, cursor.Mode, out value, out int nextPos);
+        if (st.IsParsed)
         {
-            var bRes = cursor.ReadU8();
-            if (!bRes.TryGetValue(out Parsed<byte> bOk))
-            {
-                cursor.Reset(cp);
-                return bRes.PropagateNonParsed<int>();
-            }
+            cursor.Position = nextPos;
+        }
+        return st;
+    }
 
-            byte b = bOk.Value;
-            value |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                return new Parsed<int>(value);
-            }
-
-            shift += 7;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static FastStatus TryReadVbiCore(
+        ref byte baseRef,
+        int pos,
+        int end,
+        InputMode mode,
+        out int value,
+        out int nextPos)
+    {
+        int rem = end - pos;
+        if (rem < 1)
+        {
+            Unsafe.SkipInit(out value);
+            Unsafe.SkipInit(out nextPos);
+            return mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
         }
 
-        cursor.Reset(cp);
-        return Failure.At(cp.Position, ErrorKind.VarInt, "MQTT Variable Byte Integer exceeds 4 bytes");
+        ref byte p = ref Unsafe.Add(ref baseRef, (nint)(uint)pos);
+
+        int b0 = p;
+        if (b0 < 0x80)
+        {
+            value = b0;
+            nextPos = pos + 1;
+            return FastStatus.Parsed;
+        }
+
+        if (rem < 2)
+        {
+            Unsafe.SkipInit(out value);
+            Unsafe.SkipInit(out nextPos);
+            return mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
+        }
+
+        int b1 = Unsafe.Add(ref p, 1);
+        int v = (b0 & 0x7F) | ((b1 & 0x7F) << 7);
+        if (b1 < 0x80)
+        {
+            value = v;
+            nextPos = pos + 2;
+            return FastStatus.Parsed;
+        }
+
+        if (rem < 3)
+        {
+            Unsafe.SkipInit(out value);
+            Unsafe.SkipInit(out nextPos);
+            return mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
+        }
+
+        int b2 = Unsafe.Add(ref p, 2);
+        v |= (b2 & 0x7F) << 14;
+        if (b2 < 0x80)
+        {
+            value = v;
+            nextPos = pos + 3;
+            return FastStatus.Parsed;
+        }
+
+        if (rem < 4)
+        {
+            Unsafe.SkipInit(out value);
+            Unsafe.SkipInit(out nextPos);
+            return mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
+        }
+
+        int b3 = Unsafe.Add(ref p, 3);
+        if (b3 >= 0x80)
+        {
+            Unsafe.SkipInit(out value);
+            Unsafe.SkipInit(out nextPos);
+            return FastStatus.Failure;
+        }
+
+        value = v | (b3 << 21);
+        nextPos = pos + 4;
+        return FastStatus.Parsed;
+    }
+
+    /// <summary>Reads an MQTT 5.0 1..4 byte Variable Byte Integer (up to 268,435,455).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ParseResult<int> ReadVariableByteInt(ref ByteCursor cursor)
+    {
+        int start = cursor.Position;
+        var st = TryReadVariableByteInt(ref cursor, out int value);
+        if (st.IsParsed) return new Parsed<int>(value);
+        if (st.IsIncomplete) return Incomplete.AtLeast(1);
+        return st.IsFailure
+            ? Failure.At(start, ErrorKind.VarInt, "MQTT Variable Byte Integer exceeds 4 bytes")
+            : Backtrack.At(start, ErrorKind.Eof);
+    }
+
+    /// <summary>
+    /// High-throughput zero-GC-ref <see cref="FastStatus"/> entry point for decoding an OASIS MQTT v5.0 control packet.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static FastStatus TryParsePacket(ref ByteCursor cursor, out MqttPacket packet)
+    {
+        int start = cursor.Position;
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        int len = buf.Length;
+        if (start >= len)
+        {
+            Unsafe.SkipInit(out packet);
+            return cursor.Mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
+        }
+
+        ref byte baseRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buf);
+        byte firstByte = Unsafe.Add(ref baseRef, (nint)(uint)start);
+        var packetType = (MqttPacketType)(firstByte >> 4);
+        byte flags = (byte)(firstByte & 0x0F);
+
+        cursor.Position = start + 1;
+        var remLenSt = TryReadVariableByteInt(ref cursor, out int remainingLength);
+        if (!remLenSt.IsParsed)
+        {
+            cursor.Position = start;
+            Unsafe.SkipInit(out packet);
+            return remLenSt;
+        }
+
+        int bodyBase = cursor.Position;
+        int avail = len - bodyBase;
+        if (avail < remainingLength)
+        {
+            cursor.Position = start;
+            Unsafe.SkipInit(out packet);
+            return cursor.Mode == InputMode.Streaming
+                ? FastStatus.IncompleteBytes(remainingLength - avail)
+                : FastStatus.Backtrack;
+        }
+
+        int bodyEnd = bodyBase + remainingLength;
+        int pPos = bodyBase;
+
+        // Fast hot path: MQTT v5 PUBLISH
+        if (packetType == MqttPacketType.Publish)
+        {
+            bool dup = (flags & 0x08) != 0;
+            byte qos = (byte)((flags >> 1) & 0x03);
+            bool retain = (flags & 0x01) != 0;
+            if (qos == 3 || (qos == 0 && dup) || remainingLength < 2)
+            {
+                cursor.Position = start;
+                Unsafe.SkipInit(out packet);
+                return FastStatus.Failure;
+            }
+
+            ushort topicLen = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+            if (BitConverter.IsLittleEndian) topicLen = BinaryPrimitives.ReverseEndianness(topicLen);
+            pPos += 2;
+            if (bodyEnd - pPos < topicLen)
+            {
+                cursor.Position = start;
+                Unsafe.SkipInit(out packet);
+                return FastStatus.Failure;
+            }
+
+            var topicSlice = new ByteSlice(pPos, topicLen);
+            pPos += topicLen;
+
+            Option<ushort> packetId = Option<ushort>.Nothing;
+            if (qos > 0)
+            {
+                if (bodyEnd - pPos < 2)
+                {
+                    cursor.Position = start;
+                    Unsafe.SkipInit(out packet);
+                    return FastStatus.Failure;
+                }
+
+                ushort pid = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) pid = BinaryPrimitives.ReverseEndianness(pid);
+                if (pid == 0)
+                {
+                    cursor.Position = start;
+                    Unsafe.SkipInit(out packet);
+                    return FastStatus.Failure;
+                }
+
+                packetId = Option<ushort>.Of(pid);
+                pPos += 2;
+            }
+
+            if (!TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out ByteSlice props))
+            {
+                cursor.Position = start;
+                Unsafe.SkipInit(out packet);
+                return FastStatus.Failure;
+            }
+
+            var payload = new ByteSlice(pPos, bodyEnd - pPos);
+            cursor.Position = bodyEnd;
+            packet = new MqttPublishPacket(dup, qos, retain, topicSlice, packetId, props, payload);
+            return FastStatus.Parsed;
+        }
+
+        return TryParseNonPublishPacket(ref cursor, start, packetType, flags, bodyBase, remainingLength, out packet);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static FastStatus TryParseNonPublishPacket(
+        ref ByteCursor cursor,
+        int start,
+        MqttPacketType packetType,
+        byte flags,
+        int bodyBase,
+        int remainingLength,
+        out MqttPacket packet)
+    {
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        ref byte baseRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buf);
+        int bodyEnd = bodyBase + remainingLength;
+        int pPos = bodyBase;
+
+        switch (packetType)
+        {
+            case MqttPacketType.Connect:
+            {
+                if (flags != 0 || remainingLength < 10) goto fail;
+                ushort protoLen = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) protoLen = BinaryPrimitives.ReverseEndianness(protoLen);
+                pPos += 2;
+                if (protoLen != 4 || bodyEnd - pPos < 8 || !buf.Slice(pPos, 4).SequenceEqual("MQTT"u8)) goto fail;
+                pPos += 4;
+                byte lvl = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                byte cf = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                ushort ka = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) ka = BinaryPrimitives.ReverseEndianness(ka);
+                pPos += 2;
+                if (lvl != 5 || (cf & 0x01) != 0) goto fail;
+                if (!TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out ByteSlice props)) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttConnectPacket(lvl, cf, ka, props, new ByteSlice(pPos, bodyEnd - pPos));
+                return FastStatus.Parsed;
+            }
+
+            case MqttPacketType.ConnAck:
+            {
+                if (flags != 0 || remainingLength < 2) goto fail;
+                byte ackFlags = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                byte reason = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                if ((ackFlags & 0xFE) != 0) goto fail;
+                if (!TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out ByteSlice props) || pPos != bodyEnd) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttConnAckPacket((ackFlags & 1) != 0, reason, props);
+                return FastStatus.Parsed;
+            }
+
+            case MqttPacketType.PubAck:
+            {
+                if (flags != 0 || remainingLength < 2) goto fail;
+                ushort pid = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) pid = BinaryPrimitives.ReverseEndianness(pid);
+                pPos += 2;
+                if (pid == 0) goto fail;
+                byte rc = 0;
+                ByteSlice props = ByteSlice.Empty;
+                if (pPos < bodyEnd)
+                {
+                    rc = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                    if (pPos < bodyEnd && !TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out props)) goto fail;
+                }
+                if (pPos != bodyEnd) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttPubAckPacket(pid, rc, props);
+                return FastStatus.Parsed;
+            }
+
+            case MqttPacketType.Subscribe:
+            {
+                if (flags != 0x02 || remainingLength < 2) goto fail;
+                ushort pid = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) pid = BinaryPrimitives.ReverseEndianness(pid);
+                pPos += 2;
+                if (pid == 0 || !TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out ByteSlice props) || pPos >= bodyEnd) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttSubscribePacket(pid, props, new ByteSlice(pPos, bodyEnd - pPos));
+                return FastStatus.Parsed;
+            }
+
+            case MqttPacketType.SubAck:
+            {
+                if (flags != 0 || remainingLength < 2) goto fail;
+                ushort pid = Unsafe.ReadUnaligned<ushort>(ref Unsafe.Add(ref baseRef, (nint)(uint)pPos));
+                if (BitConverter.IsLittleEndian) pid = BinaryPrimitives.ReverseEndianness(pid);
+                pPos += 2;
+                if (pid == 0 || !TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out ByteSlice props) || pPos >= bodyEnd) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttSubAckPacket(pid, props, new ByteSlice(pPos, bodyEnd - pPos));
+                return FastStatus.Parsed;
+            }
+
+            case MqttPacketType.PingReq:
+                if (flags != 0 || remainingLength != 0) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttPingReqPacket();
+                return FastStatus.Parsed;
+
+            case MqttPacketType.PingResp:
+                if (flags != 0 || remainingLength != 0) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttPingRespPacket();
+                return FastStatus.Parsed;
+
+            case MqttPacketType.Disconnect:
+            {
+                if (flags != 0) goto fail;
+                byte rc = 0;
+                ByteSlice props = ByteSlice.Empty;
+                if (pPos < bodyEnd)
+                {
+                    rc = Unsafe.Add(ref baseRef, (nint)(uint)pPos++);
+                    if (pPos < bodyEnd && !TryReadPropertiesSpan(ref baseRef, ref pPos, bodyEnd, out props)) goto fail;
+                }
+                if (pPos != bodyEnd) goto fail;
+                cursor.Position = bodyEnd;
+                packet = new MqttDisconnectPacket(rc, props);
+                return FastStatus.Parsed;
+            }
+
+            default:
+                goto fail;
+        }
+
+    fail:
+        cursor.Position = start;
+        Unsafe.SkipInit(out packet);
+        return FastStatus.Failure;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryReadPropertiesSpan(ref byte baseRef, ref int pos, int end, out ByteSlice properties)
+    {
+        if (!TryReadVbiCore(ref baseRef, pos, end, InputMode.Complete, out int propLen, out int propStart).IsParsed
+            || end - propStart < propLen)
+        {
+            properties = default;
+            return false;
+        }
+
+        properties = new ByteSlice(propStart, propLen);
+        pos = propStart + propLen;
+        return true;
     }
 
     public static ParseResult<MqttPacket> ParsePacket(ref ByteCursor cursor)

@@ -233,23 +233,27 @@ RunBench("tlv_stream16", "cs15/fast", TlvOps, tlvBytes, ops => BenchTlvFast(tlvR
 RunBench("tlv_stream16", "cs15/struct", TlvOps, tlvBytes, ops => BenchTlvStruct(tlvRing, ops));
 RunBench("tlv_stream16", "cs15/comb", TlvOps, tlvBytes, ops => BenchTlv(tlvRing, ops));
 
-// 5. PNG full document + CRC-32 (zero-boxing custom [Union] PngChunk + flat slicing-by-8+4 CRC-32)
+// 5. PNG full document + CRC-32 (zero-boxing custom [Union] PngChunk + PCLMULQDQ/slicing-by-8 CRC-32)
 const int PngOps = 200_000;
+RunBench("png_chunks_crc", "cs15/try", PngOps, pngBytes, ops => BenchPngTry(pngRing, ops));
 RunBench("png_chunks_crc", "cs15/spanforge", PngOps, pngBytes, ops => BenchPng(pngRing, ops));
 
 // 6. Protobuf wire message (6 mixed fields: varints, fixed64, fixed32, length-delimited)
 var pbRing = GenProtobufRing();
 const int PbOps = 500_000;
+RunBench("protobuf_msg", "cs15/try", PbOps, pbRing[0].Length, ops => BenchProtobufTry(pbRing, ops));
 RunBench("protobuf_msg", "cs15/spanforge", PbOps, pbRing[0].Length, ops => BenchProtobuf(pbRing, ops));
 
 // 7. HTTP/2 frame sequence (SETTINGS + HEADERS + DATA per op)
 var h2Ring = GenHttp2Ring();
 const int H2Ops = 500_000;
+RunBench("http2_frames", "cs15/try", H2Ops, h2Ring[0].Length, ops => BenchHttp2Try(h2Ring, ops));
 RunBench("http2_frames", "cs15/spanforge", H2Ops, h2Ring[0].Length, ops => BenchHttp2(h2Ring, ops));
 
 // 8. MQTT v5.0 PUBLISH packet (QoS 1 + topic + packet ID + properties + payload)
 var mqttRing = GenMqttRing();
 const int MqttOps = 500_000;
+RunBench("mqtt5_publish", "cs15/try", MqttOps, mqttRing[0].Length, ops => BenchMqttTry(mqttRing, ops));
 RunBench("mqtt5_publish", "cs15/spanforge", MqttOps, mqttRing[0].Length, ops => BenchMqtt(mqttRing, ops));
 
 // 9. Compile-time generated [BinaryStruct] TryParse + Parse/TryWriteTo roundtrip
@@ -257,6 +261,15 @@ var genRing = GenBinaryStructRing();
 const int GenOps = 1_000_000;
 RunBench("gen_struct", "cs15/tryparse", GenOps, genRing[0].Length, ops => BenchGeneratedStructTryParse(genRing, ops));
 RunBench("gen_struct_rw", "cs15/roundtrip", GenOps, genRing[0].Length, ops => BenchGeneratedStructRoundtrip(genRing, ops));
+
+// 10. SIMD payload kernels (1 KiB WebSocket Vector256 unmask + 4 KiB PNG PCLMULQDQ CRC-32)
+byte[] wsBig = new byte[1024];
+for (int i = 0; i < wsBig.Length; i++) wsBig[i] = (byte)(i * 31 + 17);
+RunBench("ws_unmask_1k", "cs15/simd256", 1_000_000, wsBig.Length, ops => BenchWsUnmask1K(wsBig, ops));
+
+byte[] crcBig = new byte[4096];
+for (int i = 0; i < crcBig.Length; i++) crcBig[i] = (byte)(i * 13 + 7);
+RunBench("png_crc_4k", "cs15/pclmul", 200_000, crcBig.Length, ops => BenchPngCrc4K(crcBig, ops));
 
 return;
 
@@ -358,6 +371,29 @@ static byte[][] GenBinaryStructRing()
 }
 
 [MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchProtobufTry(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        while (!c.IsAtEnd)
+        {
+            if (ProtobufParser.TryParseField(ref c, out ProtobufField f).IsParsed)
+            {
+                if (f.TryGetValue(out ProtobufVarIntField vi)) acc = unchecked(acc + vi.Value + vi.FieldNumber);
+                else if (f.TryGetValue(out ProtobufFixed64Field f64)) acc = unchecked(acc + f64.Bits);
+                else if (f.TryGetValue(out ProtobufFixed32Field f32)) acc = unchecked(acc + f32.Bits);
+                else if (f.TryGetValue(out ProtobufLengthDelimitedField ld)) acc = unchecked(acc + (ulong)ld.Payload.Length + buf[ld.Payload.Offset]);
+            }
+            else break;
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
 static ulong BenchProtobuf(byte[][] ring, int ops)
 {
     ulong acc = 0;
@@ -374,6 +410,28 @@ static ulong BenchProtobuf(byte[][] ring, int ops)
                 else if (f.TryGetValue(out ProtobufFixed64Field f64)) acc = unchecked(acc + f64.Bits);
                 else if (f.TryGetValue(out ProtobufFixed32Field f32)) acc = unchecked(acc + f32.Bits);
                 else if (f.TryGetValue(out ProtobufLengthDelimitedField ld)) acc = unchecked(acc + (ulong)ld.Payload.Length + buf[ld.Payload.Offset]);
+            }
+            else break;
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchHttp2Try(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        while (!c.IsAtEnd)
+        {
+            if (Http2FrameParser.TryParseFrame(ref c, out Http2Frame f).IsParsed)
+            {
+                if (f.TryGetValue(out Http2SettingsFrame s)) acc = unchecked(acc + (ulong)s.Entries.Length);
+                else if (f.TryGetValue(out Http2HeadersFrame h)) acc = unchecked(acc + h.StreamId + (ulong)h.HeaderBlockFragment.Length);
+                else if (f.TryGetValue(out Http2DataFrame d)) acc = unchecked(acc + d.StreamId + (ulong)d.Data.Length + buf[d.Data.Offset]);
             }
             else break;
         }
@@ -405,6 +463,23 @@ static ulong BenchHttp2(byte[][] ring, int ops)
 }
 
 [MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchMqttTry(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & (RingSize - 1)];
+        var c = new ByteCursor(buf);
+        if (MqttV5Parser.TryParsePacket(ref c, out MqttPacket pkt).IsParsed &&
+            pkt.TryGetValue(out MqttPublishPacket pub))
+        {
+            acc = unchecked(acc + (ulong)pub.TopicName.Length + (ulong)pub.Payload.Length + buf[pub.Payload.Offset]);
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
 static ulong BenchMqtt(byte[][] ring, int ops)
 {
     ulong acc = 0;
@@ -417,6 +492,73 @@ static ulong BenchMqtt(byte[][] ring, int ops)
         {
             acc = unchecked(acc + (ulong)pub.TopicName.Length + (ulong)pub.Payload.Length + buf[pub.Payload.Offset]);
         }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchPngTry(byte[][] ring, int ops)
+{
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        byte[] buf = ring[iter & 255];
+        ReadOnlySpan<byte> span = buf;
+        var c = span.AsCursor();
+        if (!PngParser.TryParseSignature(ref c).IsParsed) continue;
+
+        chunkLoop:
+        while (PngParser.TryParseChunk(ref c, out PngChunk chunk).IsParsed)
+        {
+            switch (chunk)
+            {
+                case IhdrChunk h:
+                    acc = unchecked(acc + h.Width + h.Height);
+                    break;
+                case PlteChunk p:
+                    acc = unchecked(acc + (ulong)p.EntryCount);
+                    break;
+                case TextChunk(var kw, var txt):
+                    acc = unchecked(acc + (ulong)(kw.Length + txt.Length));
+                    break;
+                case IdatChunk(var d):
+                    acc = unchecked(acc + span[d][0] + (ulong)d.Length);
+                    break;
+                case UnknownChunk u:
+                    acc = unchecked(acc + u.TypeCode);
+                    break;
+                case IendChunk:
+                    acc = unchecked(acc + 1UL);
+                    break chunkLoop;
+            }
+        }
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchWsUnmask1K(byte[] payload, int ops)
+{
+    Span<byte> dst = stackalloc byte[1024];
+    var slice = new ByteSlice(0, payload.Length);
+    ulong acc = 0;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        var mask = Option<uint>.Of(0x37FA213Du ^ (uint)iter);
+        WebSocketFrameParser.UnmaskInto(payload, slice, mask, dst);
+        acc = unchecked(acc + dst[0] + dst[1023]);
+    }
+    return acc;
+}
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static ulong BenchPngCrc4K(byte[] data, int ops)
+{
+    ulong acc = 0;
+    ReadOnlySpan<byte> span = data;
+    for (int iter = 0; iter < ops; iter++)
+    {
+        acc = unchecked(acc + PngParser.ComputeCrc32(span));
     }
     return acc;
 }
@@ -615,8 +757,8 @@ static ulong SumBytes(ReadOnlySpan<byte> s)
 {
     ulong sum = 0;
     ref byte r = ref MemoryMarshal.GetReference(s);
-    int i = 0;
-    int len = s.Length;
+    nuint i = 0;
+    nuint len = (nuint)(uint)s.Length;
     while (i + 8 <= len)
     {
         sum += (ulong)(Unsafe.Add(ref r, i) + Unsafe.Add(ref r, i + 1) + Unsafe.Add(ref r, i + 2) + Unsafe.Add(ref r, i + 3)
@@ -1133,11 +1275,10 @@ public readonly struct TryTlvFolder : ITryDispatchFolder<byte, ulong>
         {
             var s = c.TryReadLengthPrefixedU16BE(out ByteSlice slice);
             if (!s.IsParsed) return s;
-            ReadOnlySpan<byte> payload = c.Buffer.Slice(slice.Offset, slice.Length);
+            ref byte r = ref Unsafe.Add(ref MemoryMarshal.GetReference(c.Buffer), (nint)(uint)slice.Offset);
             ulong sum = 0;
-            ref byte r = ref MemoryMarshal.GetReference(payload);
-            int i = 0;
-            int len = payload.Length;
+            nuint i = 0;
+            nuint len = (nuint)(uint)slice.Length;
             while (i + 8 <= len)
             {
                 sum += (ulong)(Unsafe.Add(ref r, i) + Unsafe.Add(ref r, i + 1) + Unsafe.Add(ref r, i + 2) + Unsafe.Add(ref r, i + 3)

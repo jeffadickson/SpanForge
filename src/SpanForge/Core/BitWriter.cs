@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace SpanForge;
 
@@ -38,11 +39,53 @@ public ref struct BitWriter
     public void Reset(BitCheckpoint checkpoint) => _bitPosition = checkpoint.BitPosition;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryWriteBool(bool value) => TryWriteU64(1, value ? 1UL : 0UL);
+    public bool TryWriteBool(bool value)
+    {
+        int bitPos = _bitPosition;
+        if ((_buffer.Length << 3) - bitPos < 1) return false;
+
+        ref byte dst = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)(bitPos >> 3));
+        int shift = 7 - (bitPos & 7);
+        int bit = value ? 1 : 0;
+        dst = (byte)((dst & ~(1 << shift)) | (bit << shift));
+        _bitPosition = bitPos + 1;
+        return true;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryWriteU8(int bitCount, byte value) =>
-        (uint)bitCount <= 8u && TryWriteU64(bitCount, value);
+    public bool TryWriteU8(int bitCount, byte value)
+    {
+        int bitPos = _bitPosition;
+        if ((uint)bitCount > 8u || (_buffer.Length << 3) - bitPos < bitCount) return false;
+        if (bitCount == 0) return true;
+
+        int byteIdx = bitPos >> 3;
+        int bitOffset = bitPos & 7;
+        int availInByte = 8 - bitOffset;
+        ref byte p = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)byteIdx);
+
+        if (bitCount <= availInByte)
+        {
+            int mask = (1 << bitCount) - 1;
+            int shift = availInByte - bitCount;
+            p = (byte)((p & ~(mask << shift)) | ((value & mask) << shift));
+        }
+        else
+        {
+            int nextBits = bitCount - availInByte;
+            int hiMask = (1 << availInByte) - 1;
+            int hiVal = (value >> nextBits) & hiMask;
+            p = (byte)((p & ~hiMask) | hiVal);
+
+            int loShift = 8 - nextBits;
+            int loMask = (1 << nextBits) - 1;
+            ref byte pNext = ref Unsafe.Add(ref p, 1);
+            pNext = (byte)((pNext & ~(loMask << loShift)) | ((value & loMask) << loShift));
+        }
+
+        _bitPosition = bitPos + bitCount;
+        return true;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryWriteU16(int bitCount, ushort value) =>

@@ -229,16 +229,33 @@ public static class ProtobufParser
 
     /// <summary>
     /// High-throughput zero-spill <see cref="FastStatus"/> entry point for decoding one Protobuf wire field.
+    /// Uses 100% zero-GC-ref <see cref="ByteCursor"/> fast paths across all wire types.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static FastStatus TryParseField(ref ByteCursor cursor, out ProtobufField field)
     {
         int start = cursor.Position;
-        var tagSt = cursor.TryReadVarUInt64(out ulong rawTag);
-        if (!tagSt.IsParsed)
+        ReadOnlySpan<byte> buf = cursor.Buffer;
+        int len = buf.Length;
+        if (start >= len)
         {
             Unsafe.SkipInit(out field);
-            return tagSt;
+            return cursor.Mode == InputMode.Streaming ? FastStatus.IncompleteBytes(1) : FastStatus.Backtrack;
+        }
+
+        ulong rawTag = Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buf), (nint)(uint)start);
+        if (rawTag < 0x80)
+        {
+            cursor.Position = start + 1;
+        }
+        else
+        {
+            var tagSt = cursor.TryReadVarUInt64(out rawTag);
+            if (!tagSt.IsParsed)
+            {
+                Unsafe.SkipInit(out field);
+                return tagSt;
+            }
         }
 
         ulong fieldNum64 = rawTag >> 3;
@@ -252,71 +269,59 @@ public static class ProtobufParser
         uint fieldNumber = (uint)fieldNum64;
         uint wireType = (uint)(rawTag & 0x7UL);
 
-        if (wireType == (uint)ProtobufWireType.VarInt)
+        switch (wireType)
         {
-            var vSt = cursor.TryReadVarUInt64(out ulong val);
-            if (!vSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return vSt; }
-            field = new ProtobufVarIntField(fieldNumber, val);
-            return FastStatus.Parsed;
-        }
-
-        if (wireType == (uint)ProtobufWireType.LengthDelimited)
-        {
-            var lSt = cursor.TryReadVarUInt64(out ulong len64);
-            if (!lSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return lSt; }
-            if (len64 > int.MaxValue) { cursor.Position = start; Unsafe.SkipInit(out field); return FastStatus.Failure; }
-            int len = (int)len64;
-            int pos = cursor.Position;
-            int rem = cursor.Buffer.Length - pos;
-            if (rem < len)
+            case (uint)ProtobufWireType.VarInt:
             {
+                var vSt = cursor.TryReadVarUInt64(out ulong val);
+                if (!vSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return vSt; }
+                field = new ProtobufVarIntField(fieldNumber, val);
+                return FastStatus.Parsed;
+            }
+
+            case (uint)ProtobufWireType.LengthDelimited:
+            {
+                var lSt = cursor.TryReadVarUInt64(out ulong len64);
+                if (!lSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return lSt; }
+                if (len64 > int.MaxValue) { cursor.Position = start; Unsafe.SkipInit(out field); return FastStatus.Failure; }
+                int sliceLen = (int)len64;
+                int pos = cursor.Position;
+                int rem = len - pos;
+                if (rem < sliceLen)
+                {
+                    cursor.Position = start;
+                    Unsafe.SkipInit(out field);
+                    return cursor.Mode == InputMode.Streaming
+                        ? FastStatus.IncompleteBytes(sliceLen - rem)
+                        : FastStatus.Backtrack;
+                }
+
+                cursor.Position = pos + sliceLen;
+                field = new ProtobufLengthDelimitedField(fieldNumber, new ByteSlice(pos, sliceLen));
+                return FastStatus.Parsed;
+            }
+
+            case (uint)ProtobufWireType.Fixed64:
+            {
+                var fSt = cursor.TryReadU64LE(out ulong bits);
+                if (!fSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return fSt; }
+                field = new ProtobufFixed64Field(fieldNumber, bits);
+                return FastStatus.Parsed;
+            }
+
+            case (uint)ProtobufWireType.Fixed32:
+            {
+                var fSt = cursor.TryReadU32LE(out uint bits);
+                if (!fSt.IsParsed) { cursor.Position = start; Unsafe.SkipInit(out field); return fSt; }
+                field = new ProtobufFixed32Field(fieldNumber, bits);
+                return FastStatus.Parsed;
+            }
+
+            default:
                 cursor.Position = start;
                 Unsafe.SkipInit(out field);
-                return cursor.Mode == InputMode.Streaming
-                    ? FastStatus.IncompleteBytes(len - rem)
-                    : FastStatus.Backtrack;
-            }
-
-            cursor.Position = pos + len;
-            field = new ProtobufLengthDelimitedField(fieldNumber, new ByteSlice(pos, len));
-            return FastStatus.Parsed;
+                return FastStatus.Failure;
         }
-
-        if (wireType == (uint)ProtobufWireType.Fixed64)
-        {
-            var fRes = cursor.ReadU64LE();
-            if (fRes.TryGetValue(out Parsed<ulong> ok))
-            {
-                field = new ProtobufFixed64Field(fieldNumber, ok.Value);
-                return FastStatus.Parsed;
-            }
-
-            cursor.Position = start;
-            Unsafe.SkipInit(out field);
-            return fRes.TryGetValue(out Incomplete inc) && inc.Needed.TryGetValue(out ExactBytes ex)
-                ? FastStatus.IncompleteBytes(ex.Count)
-                : FastStatus.Backtrack;
-        }
-
-        if (wireType == (uint)ProtobufWireType.Fixed32)
-        {
-            var fRes = cursor.ReadU32LE();
-            if (fRes.TryGetValue(out Parsed<uint> ok))
-            {
-                field = new ProtobufFixed32Field(fieldNumber, ok.Value);
-                return FastStatus.Parsed;
-            }
-
-            cursor.Position = start;
-            Unsafe.SkipInit(out field);
-            return fRes.TryGetValue(out Incomplete inc) && inc.Needed.TryGetValue(out ExactBytes ex)
-                ? FastStatus.IncompleteBytes(ex.Count)
-                : FastStatus.Backtrack;
-        }
-
-        cursor.Position = start;
-        Unsafe.SkipInit(out field);
-        return FastStatus.Failure;
     }
 
     /// <summary>

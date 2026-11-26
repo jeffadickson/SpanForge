@@ -19,6 +19,7 @@ public delegate TOut SpanFrameProjector<in T, out TOut>(T value, ReadOnlySpan<by
 public static class PipeSequenceAdapter
 {
     public const int DefaultMaxBufferSize = 1_048_576; // 1 MiB
+    public const int StackAllocThreshold = 256;
 
     /// <summary>
     /// Attempts to parse one item from <paramref name="sequence"/> using a <see cref="SpanParser{T}"/>.
@@ -51,12 +52,29 @@ public static class PipeSequenceAdapter
         }
 
         int copyLen = (int)Math.Min(sequence.Length, maxBufferSize);
+        InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
+
+        if (copyLen <= StackAllocThreshold)
+        {
+            Span<byte> stackBuf = stackalloc byte[StackAllocThreshold];
+            Span<byte> slice = stackBuf[..copyLen];
+            sequence.Slice(0, copyLen).CopyTo(slice);
+            var cursor = new ByteCursor(slice, endianness, effectiveMode);
+            result = parser(ref cursor);
+            if (result.IsParsed)
+            {
+                consumed = sequence.GetPosition(cursor.Position);
+                return true;
+            }
+
+            consumed = sequence.Start;
+            return false;
+        }
+
         byte[] rented = ArrayPool<byte>.Shared.Rent(copyLen);
         try
         {
             sequence.Slice(0, copyLen).CopyTo(rented);
-            // If sequence was truncated by maxBufferSize, keep Streaming mode unless truly at end
-            InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
             var cursor = new ByteCursor(rented.AsSpan(0, copyLen), endianness, effectiveMode);
             result = parser(ref cursor);
             if (result.IsParsed)
@@ -110,12 +128,33 @@ public static class PipeSequenceAdapter
         }
 
         int copyLen = (int)Math.Min(sequence.Length, maxBufferSize);
+        InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
+
+        if (copyLen <= StackAllocThreshold)
+        {
+            Span<byte> stackBuf = stackalloc byte[StackAllocThreshold];
+            Span<byte> slice = stackBuf[..copyLen];
+            sequence.Slice(0, copyLen).CopyTo(slice);
+            var cursor = new ByteCursor(slice, endianness, effectiveMode);
+            var raw = parser(ref cursor);
+            if (raw.TryGetValue(out Parsed<T> ok))
+            {
+                TOut projected = projector(ok.Value, slice[..cursor.Position]);
+                consumed = sequence.GetPosition(cursor.Position);
+                result = new Parsed<TOut>(projected);
+                return true;
+            }
+
+            consumed = sequence.Start;
+            result = raw.PropagateNonParsed<TOut>();
+            return false;
+        }
+
         byte[] rented = ArrayPool<byte>.Shared.Rent(copyLen);
         try
         {
             sequence.Slice(0, copyLen).CopyTo(rented);
             ReadOnlySpan<byte> span = rented.AsSpan(0, copyLen);
-            InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
             var cursor = new ByteCursor(span, endianness, effectiveMode);
             var raw = parser(ref cursor);
             if (raw.TryGetValue(out Parsed<T> ok))
@@ -168,11 +207,29 @@ public static class PipeSequenceAdapter
         }
 
         int copyLen = (int)Math.Min(sequence.Length, maxBufferSize);
+        InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
+
+        if (copyLen <= StackAllocThreshold)
+        {
+            Span<byte> stackBuf = stackalloc byte[StackAllocThreshold];
+            Span<byte> slice = stackBuf[..copyLen];
+            sequence.Slice(0, copyLen).CopyTo(slice);
+            var cursor = new ByteCursor(slice, endianness, effectiveMode);
+            status = parser.TryParse(ref cursor, out value);
+            if (status.IsParsed)
+            {
+                consumed = sequence.GetPosition(cursor.Position);
+                return true;
+            }
+
+            consumed = sequence.Start;
+            return false;
+        }
+
         byte[] rented = ArrayPool<byte>.Shared.Rent(copyLen);
         try
         {
             sequence.Slice(0, copyLen).CopyTo(rented);
-            InputMode effectiveMode = (isCompleted && copyLen == sequence.Length) ? InputMode.Complete : InputMode.Streaming;
             var cursor = new ByteCursor(rented.AsSpan(0, copyLen), endianness, effectiveMode);
             status = parser.TryParse(ref cursor, out value);
             if (status.IsParsed)

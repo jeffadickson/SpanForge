@@ -728,6 +728,21 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         sb.Append(ind).Append("if ((ulong)__f_").Append(idx).Append(" != ").Append(m.AssertValue!.Value).Append("UL) { cursor.Reset(__cp); return global::SpanForge.Backtrack.At(__cp.Position, global::SpanForge.ErrorKind.Verify, \"Field '").Append(m.Name).Append("' did not match expected value ").Append(m.AssertValue.Value).AppendLine("\"); }");
     }
 
+    private static int GetFixedMemberSize(MemberKind kind) => kind switch
+    {
+        MemberKind.BoolByte or MemberKind.U8 or MemberKind.I8 => 1,
+        MemberKind.U16 or MemberKind.I16 => 2,
+        MemberKind.U32 or MemberKind.I32 or MemberKind.F32 => 4,
+        MemberKind.U64 or MemberKind.I64 or MemberKind.F64 => 8,
+        _ => -1,
+    };
+
+    private static bool IsCoalesceableWriteMember(MemberModel m) =>
+        m.Align == 0 && GetFixedMemberSize(m.Kind) > 0;
+
+    private static bool IsCoalesceableTryParseMember(MemberModel m) =>
+        m.Align == 0 && m.Magic is null && !m.AssertValue.HasValue && GetFixedMemberSize(m.Kind) > 0;
+
     private static void EmitTryParseMethod(StringBuilder sb, TypeModel model, string ind)
     {
         string fq = model.FullyQualifiedName;
@@ -736,62 +751,113 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         sb.Append(ind).AppendLine("{");
         string inner = ind + "    ";
 
-        // Fast-path direct Try* emission when all members are direct BE Try* primitives, otherwise delegate to Parse with 0 allocations!
-        bool canUseDirectTry = model.TypeMagic is null || model.TypeMagic.Length == 1;
-        if (canUseDirectTry)
+        // Fast-path direct Try* emission whenever all members are supported by zero-GC-ref Try* primitives.
+        bool canUseDirectTry = true;
+        foreach (MemberModel m in model.Members)
         {
-            foreach (MemberModel m in model.Members)
+            if (m.Align > 0 || IsBitMember(m.Kind))
             {
-                if (m.Pad > 0 || m.Align > 0 || (m.Magic is { Length: > 1 }))
-                {
-                    canUseDirectTry = false;
-                    break;
-                }
+                canUseDirectTry = false;
+                break;
+            }
 
-                bool okKind = m.Kind switch
-                {
-                    MemberKind.U8 => true,
-                    MemberKind.U16 => m.Endianness == 0,
-                    MemberKind.U32 => m.Endianness == 0,
-                    MemberKind.F64 => m.Endianness == 0,
-                    MemberKind.VarUInt64 => true,
-                    MemberKind.LengthPrefixedSlice => m.LengthPrefix == 1 && m.Endianness == 0,
-                    _ => false,
-                };
-                if (!okKind)
-                {
-                    canUseDirectTry = false;
-                    break;
-                }
+            bool okKind = m.Kind switch
+            {
+                MemberKind.BoolByte or MemberKind.U8 or MemberKind.I8 or
+                MemberKind.U16 or MemberKind.I16 or
+                MemberKind.U32 or MemberKind.I32 or
+                MemberKind.U64 or MemberKind.I64 or
+                MemberKind.F32 or MemberKind.F64 or
+                MemberKind.VarUInt64 or MemberKind.VarInt64ZigZag or MemberKind.QuicVarUInt64 or
+                MemberKind.FixedSlice or MemberKind.NestedBinaryStruct => true,
+                MemberKind.LengthPrefixedSlice => m.LengthPrefix is 0 or 1,
+                _ => false,
+            };
+            if (!okKind)
+            {
+                canUseDirectTry = false;
+                break;
             }
         }
 
         if (canUseDirectTry)
         {
             sb.Append(inner).AppendLine("int __start = cursor.Position;");
-            if (model.TypeMagic is { Length: 1 } tm)
+            if (model.TypeMagic is { Length: > 0 } tm)
             {
-                sb.Append(inner).Append("var __tm = cursor.TryTagByte(").Append(tm[0]).AppendLine(", out _);");
-                sb.Append(inner).AppendLine("if (!__tm.IsParsed) { Unsafe.SkipInit(out value); return __tm; }");
+                EmitTryMagicCheck(sb, inner, tm, "__tm");
             }
 
-            for (int k = 0; k < model.Members.Length; k++)
+            int k = 0;
+            while (k < model.Members.Length)
             {
-                MemberModel m = model.Members[k];
-                if (m.Magic is { Length: 1 } mm)
+                // Coalesce consecutive fixed-size members (without Magic/AssertValue/Align) into ONE TryTakeSpan bounds check!
+                if (IsCoalesceableTryParseMember(model.Members[k]))
                 {
-                    sb.Append(inner).Append("var __mm_").Append(k).Append(" = cursor.TryTagByte(").Append(mm[0]).AppendLine(", out _);");
-                    sb.Append(inner).Append("if (!__mm_").Append(k).AppendLine(".IsParsed) { cursor.Position = __start; Unsafe.SkipInit(out value); return __mm_" + k + "; }");
+                    int runStart = k;
+                    int runBytes = 0;
+                    while (k < model.Members.Length && IsCoalesceableTryParseMember(model.Members[k]))
+                    {
+                        runBytes += model.Members[k].Pad + GetFixedMemberSize(model.Members[k].Kind);
+                        k++;
+                    }
+
+                    if (k - runStart >= 2)
+                    {
+                        string srcVar = $"__src_{runStart}";
+                        string stVar = $"__rs_{runStart}";
+                        sb.Append(inner).Append("var ").Append(stVar).Append(" = cursor.TryTakeSpan(").Append(runBytes).Append(", out global::System.ReadOnlySpan<byte> ").Append(srcVar).AppendLine(");");
+                        sb.Append(inner).Append("if (!").Append(stVar).Append(".IsParsed) { cursor.Position = __start; Unsafe.SkipInit(out value); return ").Append(stVar).AppendLine("; }");
+
+                        int off = 0;
+                        for (int j = runStart; j < k; j++)
+                        {
+                            MemberModel rm = model.Members[j];
+                            off += rm.Pad;
+                            EmitCoalescedSpanRead(sb, inner, rm, j, srcVar, off);
+                            off += GetFixedMemberSize(rm.Kind);
+                        }
+                        continue;
+                    }
+
+                    // Single fixed-size member: fall through to single-member emission
+                    k = runStart;
                 }
 
+                MemberModel m = model.Members[k];
+                if (m.Pad > 0)
+                {
+                    sb.Append(inner).Append("var __pad_").Append(k).Append(" = cursor.TrySkip(").Append(m.Pad).AppendLine(");");
+                    sb.Append(inner).Append("if (!__pad_").Append(k).Append(".IsParsed) { cursor.Position = __start; Unsafe.SkipInit(out value); return __pad_").Append(k).AppendLine("; }");
+                }
+
+                if (m.Magic is { Length: > 0 } mm)
+                {
+                    EmitTryMagicCheck(sb, inner, mm, $"__mm_{k}", rollback: true);
+                }
+
+                bool isBe = m.Endianness == 0;
+                string suffix = isBe ? "BE" : "LE";
                 string call = m.Kind switch
                 {
+                    MemberKind.BoolByte => $"cursor.TryReadBool(out bool __f_{k})",
                     MemberKind.U8 => $"cursor.TryReadU8(out byte __f_{k})",
-                    MemberKind.U16 => $"cursor.TryReadU16BE(out ushort __f_{k})",
-                    MemberKind.U32 => $"cursor.TryReadU32BE(out uint __f_{k})",
-                    MemberKind.F64 => $"cursor.TryReadF64BE(out double __f_{k})",
+                    MemberKind.I8 => $"cursor.TryReadI8(out sbyte __f_{k})",
+                    MemberKind.U16 => $"cursor.TryReadU16{suffix}(out ushort __f_{k})",
+                    MemberKind.I16 => $"cursor.TryReadI16{suffix}(out short __f_{k})",
+                    MemberKind.U32 => $"cursor.TryReadU32{suffix}(out uint __f_{k})",
+                    MemberKind.I32 => $"cursor.TryReadI32{suffix}(out int __f_{k})",
+                    MemberKind.U64 => $"cursor.TryReadU64{suffix}(out ulong __f_{k})",
+                    MemberKind.I64 => $"cursor.TryReadI64{suffix}(out long __f_{k})",
+                    MemberKind.F32 => $"cursor.TryReadF32{suffix}(out float __f_{k})",
+                    MemberKind.F64 => $"cursor.TryReadF64{suffix}(out double __f_{k})",
                     MemberKind.VarUInt64 => $"cursor.TryReadVarUInt64(out ulong __f_{k})",
-                    MemberKind.LengthPrefixedSlice => $"cursor.TryReadLengthPrefixedU16BE(out global::SpanForge.ByteSlice __f_{k})",
+                    MemberKind.VarInt64ZigZag => $"cursor.TryReadVarInt64(out long __f_{k})",
+                    MemberKind.QuicVarUInt64 => $"cursor.TryReadQuicVarInt64(out ulong __f_{k})",
+                    MemberKind.FixedSlice => $"cursor.TryTake({m.FixedBytes}, out global::SpanForge.ByteSlice __f_{k})",
+                    MemberKind.LengthPrefixedSlice when m.LengthPrefix == 0 => $"cursor.TryReadLengthPrefixedU8(out global::SpanForge.ByteSlice __f_{k})",
+                    MemberKind.LengthPrefixedSlice when m.LengthPrefix == 1 => $"cursor.TryReadLengthPrefixedU16{suffix}(out global::SpanForge.ByteSlice __f_{k})",
+                    MemberKind.NestedBinaryStruct => $"{m.TypeName}.TryParse(ref cursor, out {m.TypeName} __f_{k})",
                     _ => throw new InvalidOperationException(),
                 };
 
@@ -802,15 +868,17 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
                 {
                     sb.Append(inner).Append("if ((ulong)__f_").Append(k).Append(" != ").Append(m.AssertValue.Value).AppendLine("UL) { cursor.Position = __start; Unsafe.SkipInit(out value); return global::SpanForge.FastStatus.Backtrack; }");
                 }
+
+                k++;
             }
 
             if (model.UsePositionalCtor)
             {
                 sb.Append(inner).Append("value = new ").Append(fq).Append('(');
-                for (int k = 0; k < model.Members.Length; k++)
+                for (int j = 0; j < model.Members.Length; j++)
                 {
-                    if (k > 0) sb.Append(", ");
-                    sb.Append("__f_").Append(k);
+                    if (j > 0) sb.Append(", ");
+                    sb.Append("__f_").Append(j);
                 }
                 sb.AppendLine(");");
             }
@@ -818,9 +886,9 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
             {
                 sb.Append(inner).Append("value = new ").Append(fq).AppendLine();
                 sb.Append(inner).AppendLine("{");
-                for (int k = 0; k < model.Members.Length; k++)
+                for (int j = 0; j < model.Members.Length; j++)
                 {
-                    sb.Append(inner).Append("    ").Append(model.Members[k].Name).Append(" = __f_").Append(k).AppendLine(",");
+                    sb.Append(inner).Append("    ").Append(model.Members[j].Name).Append(" = __f_").Append(j).AppendLine(",");
                 }
                 sb.Append(inner).AppendLine("};");
             }
@@ -848,6 +916,91 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         sb.Append(ind).AppendLine("}");
     }
 
+    private static void EmitTryMagicCheck(StringBuilder sb, string ind, byte[] bytes, string varName, bool rollback = false)
+    {
+        if (bytes.Length == 1)
+        {
+            sb.Append(ind).Append("var ").Append(varName).Append(" = cursor.TryTagByte(").Append(bytes[0]).AppendLine(", out _);");
+        }
+        else
+        {
+            sb.Append(ind).Append("var ").Append(varName).Append(" = cursor.TryTag([");
+            for (int k = 0; k < bytes.Length; k++)
+            {
+                if (k > 0) sb.Append(", ");
+                sb.Append("0x").Append(bytes[k].ToString("X2"));
+            }
+            sb.AppendLine("]);");
+        }
+
+        sb.Append(ind).Append("if (!").Append(varName).Append(".IsParsed) { ");
+        if (rollback) sb.Append("cursor.Position = __start; ");
+        sb.Append("Unsafe.SkipInit(out value); return ").Append(varName).AppendLine("; }");
+    }
+
+    private static void EmitCoalescedSpanRead(StringBuilder sb, string ind, MemberModel m, int idx, string srcVar, int off)
+    {
+        string endian = m.Endianness == 0 ? "BigEndian" : "LittleEndian";
+        string expr = m.Kind switch
+        {
+            MemberKind.BoolByte => $"{srcVar}[{off}] != 0",
+            MemberKind.U8 => $"{srcVar}[{off}]",
+            MemberKind.I8 => $"unchecked((sbyte){srcVar}[{off}])",
+            MemberKind.U16 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadUInt16{endian}({srcVar}.Slice({off}, 2))",
+            MemberKind.I16 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadInt16{endian}({srcVar}.Slice({off}, 2))",
+            MemberKind.U32 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadUInt32{endian}({srcVar}.Slice({off}, 4))",
+            MemberKind.I32 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadInt32{endian}({srcVar}.Slice({off}, 4))",
+            MemberKind.U64 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadUInt64{endian}({srcVar}.Slice({off}, 8))",
+            MemberKind.I64 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadInt64{endian}({srcVar}.Slice({off}, 8))",
+            MemberKind.F32 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadSingle{endian}({srcVar}.Slice({off}, 4))",
+            MemberKind.F64 => $"global::System.Buffers.Binary.BinaryPrimitives.ReadDouble{endian}({srcVar}.Slice({off}, 8))",
+            _ => throw new InvalidOperationException(),
+        };
+
+        sb.Append(ind).Append(m.TypeName).Append(" __f_").Append(idx).Append(" = ").Append(expr).AppendLine(";");
+    }
+
+    private static void EmitCoalescedSpanWrite(StringBuilder sb, string ind, MemberModel m, string dstVar, int off)
+    {
+        string endian = m.Endianness == 0 ? "BigEndian" : "LittleEndian";
+        switch (m.Kind)
+        {
+            case MemberKind.BoolByte:
+                sb.Append(ind).Append(dstVar).Append('[').Append(off).Append("] = this.").Append(m.Name).AppendLine(" ? (byte)1 : (byte)0;");
+                return;
+            case MemberKind.U8:
+                sb.Append(ind).Append(dstVar).Append('[').Append(off).Append("] = this.").Append(m.Name).AppendLine(";");
+                return;
+            case MemberKind.I8:
+                sb.Append(ind).Append(dstVar).Append('[').Append(off).Append("] = unchecked((byte)this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.U16:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteUInt16").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 2), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.I16:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteInt16").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 2), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.U32:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteUInt32").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 4), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.I32:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteInt32").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 4), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.U64:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteUInt64").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 8), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.I64:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteInt64").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 8), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.F32:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteSingle").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 4), this.").Append(m.Name).AppendLine(");");
+                return;
+            case MemberKind.F64:
+                sb.Append(ind).Append("global::System.Buffers.Binary.BinaryPrimitives.WriteDouble").Append(endian).Append('(').Append(dstVar).Append(".Slice(").Append(off).Append(", 8), this.").Append(m.Name).AppendLine(");");
+                return;
+        }
+    }
+
     private static void EmitWriteMethods(StringBuilder sb, TypeModel model, string ind)
     {
         string inner = ind + "    ";
@@ -858,12 +1011,59 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
         sb.Append(ind).AppendLine("{");
         sb.Append(inner).AppendLine("var __cp = writer.Save();");
 
+        int i = 0;
+        bool typeMagicConsumed = false;
+
+        // If TypeMagic is followed immediately by 1+ fixed-size members, coalesce TypeMagic + all leading fixed-size members into ONE TryReserve!
         if (model.TypeMagic is { Length: > 0 } tm)
         {
-            EmitMagicWrite(sb, inner, tm);
+            int runEnd = 0;
+            int runBytes = tm.Length;
+            while (runEnd < model.Members.Length && IsCoalesceableWriteMember(model.Members[runEnd]))
+            {
+                MemberModel rm = model.Members[runEnd];
+                runBytes += rm.Pad + (rm.Magic?.Length ?? 0) + GetFixedMemberSize(rm.Kind);
+                runEnd++;
+            }
+
+            if (runEnd >= 1)
+            {
+                typeMagicConsumed = true;
+                sb.Append(inner).Append("if (!writer.TryReserve(").Append(runBytes).AppendLine(", out global::System.Span<byte> __dst_0)) { writer.Reset(__cp); return false; }");
+                int off = 0;
+                for (int b = 0; b < tm.Length; b++)
+                {
+                    sb.Append(inner).Append("__dst_0[").Append(off++).Append("] = 0x").Append(tm[b].ToString("X2")).AppendLine(";");
+                }
+
+                for (int j = 0; j < runEnd; j++)
+                {
+                    MemberModel rm = model.Members[j];
+                    if (rm.Pad > 0)
+                    {
+                        sb.Append(inner).Append("__dst_0.Slice(").Append(off).Append(", ").Append(rm.Pad).AppendLine(").Clear();");
+                        off += rm.Pad;
+                    }
+                    if (rm.Magic is { Length: > 0 } mm)
+                    {
+                        for (int b = 0; b < mm.Length; b++)
+                        {
+                            sb.Append(inner).Append("__dst_0[").Append(off++).Append("] = 0x").Append(mm[b].ToString("X2")).AppendLine(";");
+                        }
+                    }
+                    EmitCoalescedSpanWrite(sb, inner, rm, "__dst_0", off);
+                    off += GetFixedMemberSize(rm.Kind);
+                }
+
+                i = runEnd;
+            }
         }
 
-        int i = 0;
+        if (!typeMagicConsumed && model.TypeMagic is { Length: > 0 } tmUnmerged)
+        {
+            EmitMagicWrite(sb, inner, tmUnmerged);
+        }
+
         while (i < model.Members.Length)
         {
             MemberModel m = model.Members[i];
@@ -886,6 +1086,51 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
 
                 EmitBitBlockWrite(sb, inner, model.Members, startBitIdx, i);
                 continue;
+            }
+
+            // Coalesce any contiguous run of >= 2 fixed-size members (or fixed-size member with pad/magic) into ONE TryReserve!
+            if (IsCoalesceableWriteMember(m))
+            {
+                int runStart = i;
+                int runBytes = 0;
+                int opCount = 0;
+                while (i < model.Members.Length && IsCoalesceableWriteMember(model.Members[i]))
+                {
+                    MemberModel rm = model.Members[i];
+                    if (rm.Pad > 0) { runBytes += rm.Pad; opCount++; }
+                    if (rm.Magic is { Length: > 0 } rmm) { runBytes += rmm.Length; opCount++; }
+                    runBytes += GetFixedMemberSize(rm.Kind);
+                    opCount++;
+                    i++;
+                }
+
+                if (opCount >= 2)
+                {
+                    string dstVar = $"__dst_{runStart}";
+                    sb.Append(inner).Append("if (!writer.TryReserve(").Append(runBytes).Append(", out global::System.Span<byte> ").Append(dstVar).AppendLine(")) { writer.Reset(__cp); return false; }");
+                    int off = 0;
+                    for (int j = runStart; j < i; j++)
+                    {
+                        MemberModel rm = model.Members[j];
+                        if (rm.Pad > 0)
+                        {
+                            sb.Append(inner).Append(dstVar).Append(".Slice(").Append(off).Append(", ").Append(rm.Pad).AppendLine(").Clear();");
+                            off += rm.Pad;
+                        }
+                        if (rm.Magic is { Length: > 0 } rmm)
+                        {
+                            for (int b = 0; b < rmm.Length; b++)
+                            {
+                                sb.Append(inner).Append(dstVar).Append('[').Append(off++).Append("] = 0x").Append(rmm[b].ToString("X2")).AppendLine(";");
+                            }
+                        }
+                        EmitCoalescedSpanWrite(sb, inner, rm, dstVar, off);
+                        off += GetFixedMemberSize(rm.Kind);
+                    }
+                    continue;
+                }
+
+                i = runStart;
             }
 
             if (m.Pad > 0) EmitPadWrite(sb, inner, m.Pad);
@@ -1000,17 +1245,21 @@ public sealed class BinaryStructGenerator : IIncrementalGenerator
 
             case MemberKind.LengthPrefixedSlice:
             {
-                string lpName = m.LengthPrefix switch
-                {
-                    0 => "U8",
-                    1 => "U16",
-                    2 => "U32",
-                    3 => "VarUInt64",
-                    _ => "U16",
-                };
-                string endianEnum = isBe ? "Big" : "Little";
                 sb.Append(ind).Append("var __sl_").Append(idx).Append(" = this.").Append(m.Name).AppendLine(";");
                 sb.Append(ind).Append("if (__sl_").Append(idx).Append(".Offset < 0 || __sl_").Append(idx).Append(".Length < 0 || __sl_").Append(idx).AppendLine(".End > sourceBuffer.Length) { writer.Reset(__cp); return false; }");
+                if (m.LengthPrefix == 0)
+                {
+                    sb.Append(ind).Append("if (!writer.TryWriteLengthPrefixedU8(sourceBuffer.Slice(__sl_").Append(idx).Append(".Offset, __sl_").Append(idx).AppendLine(".Length))) { writer.Reset(__cp); return false; }");
+                    return;
+                }
+                if (m.LengthPrefix == 1)
+                {
+                    sb.Append(ind).Append("if (!writer.TryWriteLengthPrefixedU16").Append(suffix).Append("(sourceBuffer.Slice(__sl_").Append(idx).Append(".Offset, __sl_").Append(idx).AppendLine(".Length))) { writer.Reset(__cp); return false; }");
+                    return;
+                }
+
+                string lpName = m.LengthPrefix == 2 ? "U32" : "VarUInt64";
+                string endianEnum = isBe ? "Big" : "Little";
                 sb.Append(ind).Append("var __savedEnd_").Append(idx).AppendLine(" = writer.Endianness;");
                 sb.Append(ind).Append("writer.Endianness = global::SpanForge.Endianness.").Append(endianEnum).AppendLine(";");
                 sb.Append(ind).Append("bool __ok_").Append(idx).Append(" = writer.TryWriteLengthPrefixedBytes(global::SpanForge.LengthPrefix.").Append(lpName).Append(", sourceBuffer.Slice(__sl_").Append(idx).Append(".Offset, __sl_").Append(idx).AppendLine(".Length));");

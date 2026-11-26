@@ -201,17 +201,17 @@ public ref partial struct ByteCursor
             ref byte p = ref Unsafe.Add(ref MemoryMarshal.GetReference(_buffer), (nint)(uint)pos);
             ulong b = p;
             if (b < 0x80) { _position = pos + 1; return new Parsed<ulong>(b); }
-            ulong result = b & 0x7F;
-            b = Unsafe.Add(ref p, 1); result |= (b & 0x7F) << 7; if (b < 0x80) { _position = pos + 2; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 2); result |= (b & 0x7F) << 14; if (b < 0x80) { _position = pos + 3; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 3); result |= (b & 0x7F) << 21; if (b < 0x80) { _position = pos + 4; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 4); result |= (b & 0x7F) << 28; if (b < 0x80) { _position = pos + 5; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 5); result |= (b & 0x7F) << 35; if (b < 0x80) { _position = pos + 6; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 6); result |= (b & 0x7F) << 42; if (b < 0x80) { _position = pos + 7; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 7); result |= (b & 0x7F) << 49; if (b < 0x80) { _position = pos + 8; return new Parsed<ulong>(result); }
-            b = Unsafe.Add(ref p, 8); result |= (b & 0x7F) << 56; if (b < 0x80) { _position = pos + 9; return new Parsed<ulong>(result); }
+            ulong result = b;
+            b = Unsafe.Add(ref p, 1); result = unchecked(result + ((b - 1UL) << 7)); if (b < 0x80) { _position = pos + 2; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 2); result = unchecked(result + ((b - 1UL) << 14)); if (b < 0x80) { _position = pos + 3; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 3); result = unchecked(result + ((b - 1UL) << 21)); if (b < 0x80) { _position = pos + 4; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 4); result = unchecked(result + ((b - 1UL) << 28)); if (b < 0x80) { _position = pos + 5; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 5); result = unchecked(result + ((b - 1UL) << 35)); if (b < 0x80) { _position = pos + 6; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 6); result = unchecked(result + ((b - 1UL) << 42)); if (b < 0x80) { _position = pos + 7; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 7); result = unchecked(result + ((b - 1UL) << 49)); if (b < 0x80) { _position = pos + 8; return new Parsed<ulong>(result); }
+            b = Unsafe.Add(ref p, 8); result = unchecked(result + ((b - 1UL) << 56)); if (b < 0x80) { _position = pos + 9; return new Parsed<ulong>(result); }
             b = Unsafe.Add(ref p, 9);
-            if (b <= 1) { _position = pos + 10; return new Parsed<ulong>(result | (b << 63)); }
+            if (b <= 1) { _position = pos + 10; return new Parsed<ulong>(unchecked(result + ((b - 1UL) << 63))); }
             return new Backtrack<TError>(TError.Create(pos, ErrorKind.VarInt));
         }
 
